@@ -1,0 +1,26 @@
+role: global_server # optional
+edge_servers:
+  - role: edge_server # optional
+    workers:
+    - bw: 1000Mbps
+      cpu: 100
+    - bw: 1000Mbps
+      cpu: 100
+    - bw: 1000Mbps
+      cpu: 100
+  - role: edge_server # optional
+    workers:
+      - bw: 1000Mbps
+        cpu: 100
+      - bw: 1000Mbps
+        cpu: 100
+      - bw: 1000Mbps
+        cpu: 100
+  - role: edge_server # optional
+    workers:
+      - bw: 1000Mbps
+        cpu: 100
+      - bw: 1000Mbps
+        cpu: 100
+      - bw: 1000Mbps
+        cpu: 100

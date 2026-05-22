@@ -1,0 +1,14 @@
+sync: false
+
+edge_servers:
+  - sync: true
+    workers:
+      - cpu: 100
+      - cpu: 100
+
+  - sync: true
+    workers:
+      - cpu: 30
+        bw: 10mbit
+      - cpu: 30
+        bw: 10mbit
