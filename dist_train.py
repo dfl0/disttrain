@@ -1,5 +1,6 @@
 import time
 import os
+import shutil
 import socket
 import numpy as np
 import torch
@@ -336,6 +337,10 @@ def build_topology_from_yaml(path, n_nodes):
             parents[worker_id] = central_server
             specs[worker_id] = [worker.get("bw"), worker.get("cpu")]
 
+    eval_cfg = root.get("eval", {})
+    eval_accuracy_threshold = eval_cfg.get("accuracy_threshold", 0.90)
+    eval_time_limit_s = eval_cfg.get("time_limit_s", 3600)
+
     return {
         "central_server": central_server,
         "edge_servers": edge_servers,
@@ -344,6 +349,8 @@ def build_topology_from_yaml(path, n_nodes):
         "children": children,
         "sync": sync,
         "bw_cpu_limits": specs,
+        "eval_accuracy_threshold": eval_accuracy_threshold,
+        "eval_time_limit_s": eval_time_limit_s,
     }
 
 
@@ -387,7 +394,8 @@ def remove_bw_cpu_limits():
     run_cmd("ip link set dev ifb0 down")
     run_cmd("modprobe -r ifb")
 
-    run_cmd("echo 0 > /sys/fs/cgroup/train_cpu/cgroup.procs")
+    with open("/sys/fs/cgroup/train_cpu/cgroup.procs", "w") as f:
+        f.write("0")
     run_cmd("rmdir /sys/fs/cgroup/train_cpu")
 
 
@@ -595,11 +603,12 @@ def load_cifar10():
 
 
 def cleanup_mpi_req(req):
-    req.Cancel()
-    try:
+    if req is not None and req != MPI.REQUEST_NULL:
         req.Cancel()
-    except MPI.Exception:
-        pass
+        try:
+            MPI.Request.Wait(req)
+        except MPI.Exception:
+            pass
 
 
 def cancel_recv_req(req):
@@ -632,19 +641,25 @@ def collect_sys_metrics(collect_metrics, interval=0.04, quiet=False):
 
     t0 = time.perf_counter()
     tot_bytes = get_net_bytes()
+    psutil.cpu_percent()  # prime the baseline; first call always returns 0.0
     while collect_metrics.is_set():
         last_tot_bytes = tot_bytes
 
         # cpu = psutil.cpu_percent(min(interval, 0.1))
-        cpu = psutil.cpu_percent()  # TODO: is an interval needed here?
-        freq = psutil.cpu_freq().current
+        cpu = psutil.cpu_percent(interval=min(interval, 0.1))
+        freq_info = psutil.cpu_freq()
+        freq = freq_info.current if freq_info else float("nan")
         mem = psutil.virtual_memory().percent
-        temp = psutil.sensors_temperatures()["cpu_thermal"][0].current
+        temp_entries = psutil.sensors_temperatures().get("cpu_thermal", [None])
+        temp = temp_entries[0].current if temp_entries[0] else float("nan")
 
-        throttled_raw = run_cmd("vcgencmd get_throttled")
-        throttled_val = int(throttled_raw.split('=')[-1], 16)
-        throttled_now = (throttled_val >> 2) % 2   # if the pi is currently throttled
-        throttled_bef = (throttled_val >> 18) % 2  # if throttling has occured before
+        if shutil.which("vcgencmd") is not None:
+            throttled_raw = run_cmd("vcgencmd get_throttled")
+            throttled_val = int(throttled_raw.split('=')[-1], 16)
+            throttled_now = (throttled_val >> 2) % 2   # if the pi is currently throttled
+            throttled_bef = (throttled_val >> 18) % 2  # if throttling has occured before
+        else:
+            throttled_now = throttled_bef = float("nan")
 
         t1 = time.perf_counter()
         tot_bytes = get_net_bytes()
@@ -687,7 +702,7 @@ def collect_sys_metrics(collect_metrics, interval=0.04, quiet=False):
 
 # ----  role functions  ------------------------------------------------------+
 
-def run_evaluator(model, root, comm):
+def run_evaluator(model, root, comm, accuracy_threshold=0.90, time_limit_s=3600):
     log("[EVALUATOR]")
 
     # -- load test data  --
@@ -697,23 +712,21 @@ def run_evaluator(model, root, comm):
     test_loader = torch.utils.data.DataLoader(
         test_ds,
         batch_size=batch_size,
-        drop_last=False
+        drop_last=False,
+        num_workers=2,
+        pin_memory=False
     )
 
     loss_fn = torch.nn.CrossEntropyLoss()
 
     global global_state
-    timer = TimeTree(print_func=log, category_stack_ref=global_state["sections"])
+    timer = TimeTree(print_func=log)
 
     flat_params = flatten_params(model)
     packet_size = flat_params.size + 1
 
     test_acc = 0
     model_version = 0
-
-    accuracy_threshold = 0.90
-    # time_threshold = 1*60*60
-    time_threshold = 30
 
     recv_buf = np.empty(packet_size, dtype=np.float32)
     new_params = False
@@ -734,7 +747,7 @@ def run_evaluator(model, root, comm):
                     flat_params[:] = recv_buf[1:]
                     new_params = True
                 else:
-                    assert False
+                    log(f"WARNING: received non-monotonic eval version {new_version} (current {model_version}), skipping")
 
         if new_params:
             recv_time = time.perf_counter() - start_time
@@ -772,9 +785,12 @@ def run_evaluator(model, root, comm):
             log(f"Evaluation (recv'd after {recv_time:.2f}s, done after {done_time:.2f}s): version {model_version}, accuracy: {test_acc:.2%}, loss: {test_loss:.4f}")
             log('*'*100)
 
-            if test_acc >= accuracy_threshold or done_time >= time_threshold:
+            if test_acc >= accuracy_threshold or done_time >= time_limit_s:
             # if True:
                 log("sending STOP message...")
+                # drain any remaining eval pushes so root does not hold dangling sends
+                while comm.Iprobe(source=0, tag=Msg.EVAL):
+                    comm.Recv(np.empty(packet_size, dtype=np.float32), source=0, tag=Msg.EVAL)
                 comm.Send(np.array([0], dtype=np.int32), dest=0, tag=Msg.STOP)
                 break
 
@@ -792,11 +808,8 @@ def run_parameter_server(model, children, evaluator, comm, sync=True):
 
     log(f"[{'SYNC' if sync else 'ASYNC'} PS]")
 
-    # -- initialize optimizer --
-    optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate)
-
     global global_state
-    timer = TimeTree(print_func=log, category_stack_ref=global_state["sections"])
+    timer = TimeTree(print_func=log)
 
     # -- initialize global params --
     model.apply(init_params)
@@ -821,6 +834,7 @@ def run_parameter_server(model, children, evaluator, comm, sync=True):
 
     send_reqs = []
     stop_reqs = []
+    eval_stopped = False
 
     # -- push initial params --
     # log("sending initial params")
@@ -835,17 +849,13 @@ def run_parameter_server(model, children, evaluator, comm, sync=True):
 
     stop_recv_req = comm.Irecv(stop_buf, source=evaluator, tag=Msg.STOP)
 
-    aggr_grads_buf = np.zeros(flat_params.size, dtype=np.float32)
-    total_weight = 0.0
-    n_updates = 0
-
     # n_to_wait = max(1, len(children)//2)
     n_to_wait = lambda: max(1, active_children//2)
     eval_interval = 200
+    max_inflight = max(8, 4 * len(children))
 
     active_children = len(children)
     children_done = set()  # keep track of children that have sent an update if synchronous
-    status = MPI.Status()
 
     log("Starting training...")
 
@@ -863,6 +873,7 @@ def run_parameter_server(model, children, evaluator, comm, sync=True):
 
                 if idx == len(reqs) - 1:
                     t["tag"] = "stop"
+                    eval_stopped = True
                     log("Stop signal received, propagating to children")
                     for child in children:
                         buf = np.array([0], dtype=np.int32)
@@ -884,48 +895,57 @@ def run_parameter_server(model, children, evaluator, comm, sync=True):
             # eta = 0.1
             # eta = 1/len(children)
             # flat_params = (1 - eta)*flat_params + eta*params
-            # flat_params -= learning_rate*params_delta
-            flat_params -= params_delta/active_children
-            model_version += 1
+            flat_params -= (learning_rate / active_children) * params_delta
 
             child_recv_reqs[idx] = comm.Irecv(child_packets[idx], source=src, tag=Msg.PUSH_GRADS)
 
-            send_packet[0] = model_version
-            send_packet[1:] = flat_params
-
             if sync:
                 children_done.add(src)
-                # log(f"children done: {children_done}")
                 # -- send updated parameters back to children after receiving update from each --
                 if len(children_done) == active_children:
-                    # log("all children done, sending back updated model")
-                    for child in children_done:
-                        # with timer.measure("push_params") as t:  # TODO: good way to time actual sending time?
-                        dst = child 
-                        buf = send_packet.copy()
-                        req = comm.Isend(buf, dest=dst, tag=Msg.PUSH_PARAMS)
-                        send_reqs.append((req, buf, dst))
-                        t["tag"] = child
+                    model_version += 1
+                    assert model_version < 2**24, f"model_version {model_version} exceeds float32 precision"
+                    send_packet[0] = model_version
+                    send_packet[1:] = flat_params
+                    with timer.measure("send_params") as ts:
+                        for child in children_done:
+                            while len(send_reqs) >= max_inflight:
+                                send_reqs = [(r, b, d) for r, b, d in send_reqs if not r.Test()]
+                            dst = child
+                            buf = send_packet.copy()
+                            req = comm.Isend(buf, dest=dst, tag=Msg.PUSH_PARAMS)
+                            send_reqs.append((req, buf, dst))
+                            ts["tag"] = dst
                     children_done.clear()
 
             else:
+                model_version += 1
+                assert model_version < 2**24, f"model_version {model_version} exceeds float32 precision"
+                send_packet[0] = model_version
+                send_packet[1:] = flat_params
                 # -- send updated parameters back to child --
-                # with timer.measure("push_params") as t:
-                dst = src
-                buf = send_packet.copy() 
-                req = comm.Isend(buf, dest=dst, tag=Msg.PUSH_PARAMS)
-                send_reqs.append((req, buf, dst))
-                t["tag"] = src
+                staleness = model_version - params_version
+                if staleness > 0:
+                    log(f"stale grad from rank {src}: computed on version {params_version}, current {model_version}, staleness {staleness}")
+                with timer.measure("send_params") as ts:
+                    while len(send_reqs) >= max_inflight:
+                        send_reqs = [(r, b, d) for r, b, d in send_reqs if not r.Test()]
+                    dst = src
+                    buf = send_packet.copy()
+                    req = comm.Isend(buf, dest=dst, tag=Msg.PUSH_PARAMS)
+                    send_reqs.append((req, buf, dst))
+                    ts["tag"] = dst
 
-            if model_version % eval_interval == 0:
-            # if model_version == 1:
+            if not eval_stopped and model_version % eval_interval == 0:
                 log(f"sending params to evaluator, version: {model_version}")
-                # with timer.measure("push_params") as t:
-                dst = evaluator
-                buf = send_packet.copy()
-                req = comm.Isend(buf, dest=dst, tag=Msg.EVAL)
-                send_reqs.append((req, buf, dst))
-                t["tag"] = "eval"
+                with timer.measure("send_params") as ts:
+                    while len(send_reqs) >= max_inflight:
+                        send_reqs = [(r, b, d) for r, b, d in send_reqs if not r.Test()]
+                    dst = evaluator
+                    buf = send_packet.copy()
+                    req = comm.Isend(buf, dest=dst, tag=Msg.EVAL)
+                    send_reqs.append((req, buf, dst))
+                    ts["tag"] = "eval"
 
             # -- clean up finished sends --
             global_state["send_reqs_children"] = []
@@ -967,7 +987,7 @@ def run_edge_parameter_server(model, parent, children, comm, sync=True):
     log(f"[{'SYNC' if sync else 'ASYNC'} EDGE PS] parent: {parent}")
 
     global global_state
-    timer = TimeTree(print_func=log, category_stack_ref=global_state["sections"])
+    timer = TimeTree(print_func=log)
 
     flat_params = flatten_params(model)
 
@@ -989,18 +1009,15 @@ def run_edge_parameter_server(model, parent, children, comm, sync=True):
 
     parent_send_reqs = []
     child_send_reqs = []
-    stop_reqs= []
+    stop_reqs = []
 
     # -- wait for initial params --
     comm.Recv(parent_packet, source=parent, tag=Msg.PUSH_PARAMS)
     model_version = int(parent_packet[0])
     flat_params[:] = parent_packet[1:]
     anchor_params = flat_params.copy()
-    # anchor_params = None
-    # model_version = -1
 
     # -- push initial params to workers --
-    # log("sending out initial params")
     for child in children:
         dst = child
         buf = parent_packet.copy()
@@ -1012,19 +1029,15 @@ def run_edge_parameter_server(model, parent, children, comm, sync=True):
     # -- pre-post receive for stop request from parent --
     stop_recv_req = comm.Irecv(stop_buf, source=parent, tag=Msg.STOP)
 
-    aggr_grads_buf = np.zeros(flat_params.size, dtype=np.float32)
-    total_weight = 0.0  # accumulate weights applied to incoming grads for normalization
-    grads_versions = []
     n_updates = 0
 
     active_children = len(children)
     children_done = set()  # keep track of children that have sent an update if synchronous
-    stop_flag = False
-    new_params = False
-    status = MPI.Status()
 
     n_to_wait = lambda: max(1, active_children//2)
     # n_to_wait = lambda: active_children
+    max_inflight_parent = max(4, 2 * active_children)
+    max_inflight_child = max(8, 4 * active_children)
 
     timer.reset()
     with timer.measure("train"):
@@ -1057,13 +1070,15 @@ def run_edge_parameter_server(model, parent, children, comm, sync=True):
                 anchor_params = flat_params.copy()
 
                 if sync:
-                    for child in children:
-                        # with timer.measure("push_params") as t:
-                        dst = child
-                        buf = parent_packet.copy()
-                        req = comm.Isend(buf, dest=dst, tag=Msg.PUSH_PARAMS)
-                        child_send_reqs.append((req, buf, dst))
-                        t["tag"] = child
+                    with timer.measure("send_params") as ts:
+                        for child in children:
+                            while len(child_send_reqs) >= max_inflight_child:
+                                child_send_reqs = [(r, b, d) for r, b, d in child_send_reqs if not r.Test()]
+                            dst = child
+                            buf = parent_packet.copy()
+                            req = comm.Isend(buf, dest=dst, tag=Msg.PUSH_PARAMS)
+                            child_send_reqs.append((req, buf, dst))
+                            ts["tag"] = dst
 
                 parent_recv_req = comm.Irecv(parent_packet, source=parent, tag=Msg.PUSH_PARAMS)
 
@@ -1074,10 +1089,14 @@ def run_edge_parameter_server(model, parent, children, comm, sync=True):
                 grads_version = int(packet[0])
                 grads = packet[1:]
 
+                staleness = model_version - grads_version
+                if staleness > 0:
+                    log(f"stale grad from rank {src}: computed on version {grads_version}, current {model_version}, staleness {staleness}")
+
                 # eta = 0.1
                 # eta = 1/len(children)
                 # flat_params = (1 - eta)*flat_params + eta*params
-                flat_params -= learning_rate*grads
+                flat_params -= (learning_rate / active_children) * grads
                 n_updates += 1
 
                 child_recv_reqs[idx] = comm.Irecv(child_packets[idx], source=src, tag=Msg.PUSH_GRADS)
@@ -1087,39 +1106,42 @@ def run_edge_parameter_server(model, parent, children, comm, sync=True):
 
                     if len(children_done) == active_children:
                         # -- send local parameter deltas to root after receiving update from each worker --
-                        # log("received update from each worker, sending up local model")
                         send_packet[0] = model_version
                         send_packet[1:] = anchor_params - flat_params  # send parameter deltas
-                        # with timer.measure("push_params") as t:
-                        dst = parent
-                        buf = send_packet.copy()
-                        req = comm.Isend(buf, dest=dst, tag=Msg.PUSH_GRADS)
-                        parent_send_reqs.append((req, buf, dst))
-                        t["tag"] = parent
+                        with timer.measure("send_params") as ts:
+                            while len(parent_send_reqs) >= max_inflight_parent:
+                                parent_send_reqs = [(r, b, d) for r, b, d in parent_send_reqs if not r.Test()]
+                            dst = parent
+                            buf = send_packet.copy()
+                            req = comm.Isend(buf, dest=dst, tag=Msg.PUSH_GRADS)
+                            parent_send_reqs.append((req, buf, dst))
+                            ts["tag"] = dst
                         children_done.clear()
 
                 else:
                     # -- send updated parameters back to worker --
-                    # log("sending back updated params")
                     send_packet[0] = model_version
                     send_packet[1:] = flat_params
-                    # with timer.measure("push_params") as t:
-                    dst = src
-                    buf = send_packet.copy()
-                    req = comm.Isend(buf, dest=dst, tag=Msg.PUSH_PARAMS)
-                    child_send_reqs.append((req, buf, dst))
-                    t["tag"] = src
+                    with timer.measure("send_params") as ts:
+                        while len(child_send_reqs) >= max_inflight_child:
+                            child_send_reqs = [(r, b, d) for r, b, d in child_send_reqs if not r.Test()]
+                        dst = src
+                        buf = send_packet.copy()
+                        req = comm.Isend(buf, dest=dst, tag=Msg.PUSH_PARAMS)
+                        child_send_reqs.append((req, buf, dst))
+                        ts["tag"] = dst
 
                     # -- push up local model deltas periodically --
                     if n_updates >= n_to_wait():
-                        # log("received enough updates, sending up local model")
                         send_packet[1:] = anchor_params - flat_params
-                        # with timer.measure("push_params") as t:
-                        dst = parent
-                        buf = send_packet.copy()
-                        req = comm.Isend(buf, dest=dst, tag=Msg.PUSH_GRADS)
-                        parent_send_reqs.append((req, buf, dst))
-                        t["tag"] = src
+                        with timer.measure("send_params") as ts:
+                            while len(parent_send_reqs) >= max_inflight_parent:
+                                parent_send_reqs = [(r, b, d) for r, b, d in parent_send_reqs if not r.Test()]
+                            dst = parent
+                            buf = send_packet.copy()
+                            req = comm.Isend(buf, dest=dst, tag=Msg.PUSH_GRADS)
+                            parent_send_reqs.append((req, buf, dst))
+                            ts["tag"] = dst
                         anchor_params = flat_params.copy()
                         n_updates = 0
 
@@ -1135,7 +1157,6 @@ def run_edge_parameter_server(model, parent, children, comm, sync=True):
                     child_send_reqs.pop(i)
                 else:
                     global_state["send_reqs_children"].append(dst)
-                    # log(f"appended child {dst} to send reqs children")
 
             global_state["n_parent_send_reqs"] = len(parent_send_reqs)
             global_state["n_child_send_reqs"] = len(child_send_reqs)
@@ -1173,7 +1194,7 @@ def run_worker(model, parent, comm, n_workers, worker_idx):
     log(f"[WORKER {worker_idx}] parent: {parent}")
 
     global global_state
-    timer = TimeTree(print_func=log, category_stack_ref=global_state["sections"])
+    timer = TimeTree(print_func=log)
 
     # -- load datasets --
     # train_ds, test_ds = load_mnist()
@@ -1186,33 +1207,18 @@ def run_worker(model, parent, comm, n_workers, worker_idx):
         shuffle=True
     )
 
-    test_sampler = torch.utils.data.distributed.DistributedSampler(
-        test_ds,
-        num_replicas=n_workers,
-        rank=worker_idx,
-        shuffle=True
-    )
-
     # -- create data loaders --
     train_loader = torch.utils.data.DataLoader(
         train_ds,
         batch_size=batch_size,
         sampler=train_sampler,
         drop_last=True,
-    )
-
-    test_loader = torch.utils.data.DataLoader(
-        test_ds,
-        batch_size=batch_size,
-        sampler=test_sampler,
-        drop_last=False,
+        num_workers=2,
+        pin_memory=False,
     )
 
     # -- define loss function --
     loss_fn = torch.nn.CrossEntropyLoss()
-
-    # -- initialize optimizer --
-    optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate)
 
     # -- pre-allocate buffers --
     packet_size = flatten_params(model).size + 1
@@ -1372,7 +1378,9 @@ def main():
             run_worker(model, parent, world, n_workers, worker_idx)
 
         case Role.EVAL:
-            run_evaluator(model, 0, world)
+            run_evaluator(model, 0, world,
+                          accuracy_threshold=topology.get("eval_accuracy_threshold"),
+                          time_limit_s=topology.get("eval_time_limit_s"))
 
     log("returned from role function")
     world.Barrier()

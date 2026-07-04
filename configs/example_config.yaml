@@ -1,5 +1,9 @@
 sync: false
 
+eval:
+  accuracy_threshold: 0.90
+  time_limit_s: 3600
+
 edge_servers:
   - sync: true
     workers:
