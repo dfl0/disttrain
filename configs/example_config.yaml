@@ -4,6 +4,13 @@ eval:
   accuracy_threshold: 0.90
   time_limit_s: 3600
 
+training:
+  learning_rate: 0.01
+  batch_size: 32
+  n_epochs: 1
+  eval_interval: 200
+  local_steps: 1    # micro-steps per PS sync; >1 reduces communication frequency
+
 edge_servers:
   - sync: true
     workers:

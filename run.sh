@@ -7,6 +7,8 @@ WDIR=/root/mpitest
 SCRIPT=dist_train.py
 FILES=(
     timetree.py
+    comm.py
+    ps.py
 )
 CONFIG=$1
 
