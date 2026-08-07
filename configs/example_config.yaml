@@ -1,6 +1,11 @@
+bind_addr: "192.168.1.1"   # root PS address
+base_port: 5550             # root PS binds on this port; base_port+1 used for STOP (from evaluator)
+
 sync: false
 
 eval:
+  host: "192.168.1.5"
+  port: 5560
   accuracy_threshold: 0.90
   time_limit_s: 3600
 
@@ -13,13 +18,19 @@ training:
 
 edge_servers:
   - sync: true
+    bind_addr: "192.168.1.2"
     workers:
-      - cpu: 100
-      - cpu: 100
+      - hostname: pi-worker-1
+        cpu: 100
+      - hostname: pi-worker-2
+        cpu: 100
 
   - sync: true
+    bind_addr: "192.168.1.3"
     workers:
-      - cpu: 30
+      - hostname: pi-worker-3
+        cpu: 30
         bw: 10mbit
-      - cpu: 30
+      - hostname: pi-worker-4
+        cpu: 30
         bw: 10mbit

@@ -12,10 +12,10 @@ import shlex
 import threading
 import psutil
 import warnings
-from mpi4py import MPI
+import zmq
 
 from timetree import TimeTree
-from comm import Role, Msg, cancel_recv_req, safe_wait_send_req, cleanup_mpi_req
+from comm import Role, Msg
 from ps import ParameterServer
 
 
@@ -25,16 +25,10 @@ warnings.filterwarnings("ignore", module="torchvision.datasets.cifar")
 # ----  get node/proc info  --------------------------------------------------+
 
 hostname = socket.gethostname()
-world = MPI.COMM_WORLD
-world_rank = world.Get_rank()
-world_size = world.Get_size()
 config_file = 'config.yaml'
 
-device_role = None
-
-world.Barrier()
-global_start_time = time.perf_counter()
-
+device_role    = None
+global_start_time = None  # set in main() after topology is parsed
 
 global_state = {
     "sections": [],
@@ -227,49 +221,21 @@ class ResNet20CIFAR(torch.nn.Module):
 
 # ----  utility functions  ---------------------------------------------------+
 
-def build_topology_from_yaml(path, n_nodes):
-    # use user defined yaml file, that specifies structure and bottlenecks, but not IDs or hostnames
+def build_topology_from_yaml(path):
     with open(path, "r") as f:
-        root = yaml.safe_load(f)
+        raw = yaml.safe_load(f)
 
-    parents = {0: None}
-    children = {i: [] for i in range(n_nodes)}
-    central_server = 0
-    id_counter = 1
-    edge_servers = []
-    workers = []
-    specs = {}
-    sync = {0: root.get("sync")}
+    base_port   = raw.get("base_port", 5550)
+    bind_addr   = raw.get("bind_addr", "127.0.0.1")
+    root_addr   = bind_addr
 
-    if "edge_servers" in root:
-        for child in root.get("edge_servers"):
-            child_id = id_counter
-            id_counter += 1
-            children[central_server].append(child_id)
-            parents[child_id] = central_server
-            edge_servers.append(child_id)
-            sync[child_id] = child.get("sync")
-            for worker in child.get("workers", []):
-                worker_id = id_counter
-                id_counter += 1
-                workers.append(worker_id)
-                specs[worker_id] = [worker.get("bw"), worker.get("cpu")]
-                children[child_id].append(worker_id)
-                parents[worker_id] = child_id
-    elif "workers" in root:
-        for worker in root.get("workers"):
-            worker_id = id_counter
-            id_counter += 1
-            workers.append(worker_id)
-            children[central_server].append(worker_id)
-            parents[worker_id] = central_server
-            specs[worker_id] = [worker.get("bw"), worker.get("cpu")]
-
-    eval_cfg = root.get("eval", {})
+    eval_cfg = raw.get("eval", {})
+    eval_host = eval_cfg.get("host", "127.0.0.1")
+    eval_port = eval_cfg.get("port", base_port + 10)
     eval_accuracy_threshold = eval_cfg.get("accuracy_threshold", 0.90)
-    eval_time_limit_s = eval_cfg.get("time_limit_s", 3600)
+    eval_time_limit_s       = eval_cfg.get("time_limit_s", 3600)
 
-    training_cfg = root.get("training", {})
+    training_cfg = raw.get("training", {})
     training = {
         "learning_rate": training_cfg.get("learning_rate", 0.01),
         "batch_size":    training_cfg.get("batch_size", 32),
@@ -278,18 +244,89 @@ def build_topology_from_yaml(path, n_nodes):
         "local_steps":   training_cfg.get("local_steps", 1),
     }
 
-    return {
-        "central_server": central_server,
-        "edge_servers": edge_servers,
-        "workers": workers,
-        "parents": parents,
-        "children": children,
-        "sync": sync,
-        "bw_cpu_limits": specs,
-        "eval_accuracy_threshold": eval_accuracy_threshold,
-        "eval_time_limit_s": eval_time_limit_s,
-        "training": training,
+    # build role-specific config keyed by hostname/address
+    node_configs = {}
+
+    # root PS
+    node_configs[_addr_key(root_addr)] = {
+        "role": Role.ROOT_PS,
+        "sync": raw.get("sync", False),
+        "bind_addr": root_addr,
+        "base_port": base_port,
+        "children_hostnames": [],  # filled below
     }
+
+    all_worker_specs = {}  # hostname → {bw, cpu, parent_addr}
+
+    if "edge_servers" in raw:
+        for edge in raw["edge_servers"]:
+            edge_addr = edge["bind_addr"]
+            child_hostnames = [w["hostname"] for w in edge.get("workers", [])]
+            node_configs[_addr_key(edge_addr)] = {
+                "role": Role.EDGE_PS,
+                "sync": edge.get("sync", False),
+                "bind_addr": edge_addr,
+                "base_port": base_port,
+                "parent_addr": root_addr,
+                "children_hostnames": child_hostnames,
+            }
+            node_configs[_addr_key(root_addr)]["children_hostnames"].append(edge_addr)
+            for w in edge.get("workers", []):
+                all_worker_specs[w["hostname"]] = {
+                    "bw": w.get("bw"), "cpu": w.get("cpu"),
+                    "parent_addr": edge_addr,
+                }
+    elif "workers" in raw:
+        child_hostnames = [w["hostname"] for w in raw["workers"]]
+        node_configs[_addr_key(root_addr)]["children_hostnames"] = child_hostnames
+        for w in raw["workers"]:
+            all_worker_specs[w["hostname"]] = {
+                "bw": w.get("bw"), "cpu": w.get("cpu"),
+                "parent_addr": root_addr,
+            }
+
+    for whost, spec in all_worker_specs.items():
+        node_configs[whost] = {"role": Role.WORKER, **spec}
+
+    node_configs[_addr_key(eval_host)] = {
+        "role": Role.EVAL,
+        "eval_host": eval_host,
+        "eval_port": eval_port,
+        "root_addr": root_addr,
+        "base_port": base_port,
+    }
+
+    return {
+        "node_configs":             node_configs,
+        "root_addr":                root_addr,
+        "base_port":                base_port,
+        "eval_host":                eval_host,
+        "eval_port":                eval_port,
+        "eval_accuracy_threshold":  eval_accuracy_threshold,
+        "eval_time_limit_s":        eval_time_limit_s,
+        "training":                 training,
+        "worker_specs":             all_worker_specs,
+    }
+
+
+def _addr_key(addr):
+    """Normalise address to a bare hostname/IP for dict key lookup."""
+    return addr.replace("tcp://", "").split(":")[0]
+
+
+def determine_role(this_hostname, topology):
+    """Match this process's hostname against the topology and return its config."""
+    key = _addr_key(this_hostname)
+    cfg = topology["node_configs"].get(key)
+    if cfg is None:
+        # also check bare hostname match (worker hostnames are not IP addresses)
+        cfg = topology["node_configs"].get(this_hostname)
+    if cfg is None:
+        raise RuntimeError(
+            f"Hostname {this_hostname!r} not found in config. "
+            f"Known keys: {list(topology['node_configs'].keys())}"
+        )
+    return cfg
 
 
 def run_cmd(cmd, check=False, capture_output=True):
@@ -304,11 +341,9 @@ def run_cmd(cmd, check=False, capture_output=True):
 
 def apply_bw_cpu_limits(bw_cpu_limits):
     # *4000 here because we have 4 cores
-    #log(f"{os.getpid()}")
     if bw_cpu_limits[0]:
         run_cmd("tc qdisc add dev eth0 root handle 1: htb default 1")
         run_cmd(f"tc class add dev eth0 parent 1: classid 1:1 htb rate {bw_cpu_limits[0]}")
-        # setup a virtual device through which to redirect incoming traffic
         run_cmd("modprobe ifb numifbs=1")
         run_cmd("ip link set dev ifb0 up")
         run_cmd("tc qdisc add dev eth0 handle ffff: ingress")
@@ -324,8 +359,8 @@ def apply_bw_cpu_limits(bw_cpu_limits):
         with open("/sys/fs/cgroup/train_cpu/cpu.max", "w") as f:
             f.write(str(f"{cpu_limit} 100000"))
 
+
 def remove_bw_cpu_limits():
-    # remove process from the cgroup, then rm the directory to clean up, delete ifb and tc rules
     run_cmd("tc qdisc del root dev eth0")
     run_cmd("tc qdisc del dev eth0 handle ffff: ingress")
     run_cmd("tc qdisc del root dev ifb0")
@@ -335,21 +370,6 @@ def remove_bw_cpu_limits():
     with open("/sys/fs/cgroup/train_cpu/cgroup.procs", "w") as f:
         f.write("0")
     run_cmd("rmdir /sys/fs/cgroup/train_cpu")
-
-
-def get_role(rank, topology):
-    role = None
-
-    if rank == topology.get("central_server"):
-        role = Role.ROOT_PS
-    elif "edge_servers" in topology and rank in topology.get("edge_servers"):
-        role = Role.EDGE_PS
-    elif rank in topology.get("workers"):
-        role = Role.WORKER
-    else:
-        return Role.EVAL, None, None, None
-
-    return role, topology.get("parents")[rank], topology.get("children")[rank], topology.get("sync").get(rank, None)
 
 
 def log(msg, indent=0):
@@ -362,13 +382,15 @@ def log(msg, indent=0):
     global device_role
     assert device_role
 
+    # use last segment of hostname (e.g. "pi-worker-1" → "worker-1") for compact prefix
+    short_host = hostname.split("-", 1)[-1] if "-" in hostname else hostname
     prefix = (
         f"({timestamp}) "
-        f"{str(world_rank):>{len(str(world_size - 1))}} "
+        f"{short_host:<12} "
         f"[{device_role.name:<{8}}]  "
     )
 
-    indent_str = "    "*indent
+    indent_str = "    " * indent
 
     print(f"{prefix}{indent_str}{msg}", flush=True)
 
@@ -507,8 +529,9 @@ def collect_sys_metrics(collect_metrics, interval=0.04, quiet=False):
         now = time.perf_counter() - global_start_time
 
         if not quiet:
-            # time.sleep(world_rank*min(interval/world_size, 0.01))
-            time.sleep(world_rank*interval/world_size)
+            # stagger log output across processes using a hostname-derived offset
+            host_offset = (hash(hostname) & 0xFF) / 255.0
+            time.sleep(host_offset * interval)
             log(
                 "[METRICS]  "
                 f"t: {now} \t"
@@ -525,11 +548,10 @@ def collect_sys_metrics(collect_metrics, interval=0.04, quiet=False):
 
 # ----  role functions  ------------------------------------------------------+
 
-def run_evaluator(model, root, comm, accuracy_threshold=0.90, time_limit_s=3600, batch_size=32):
+def run_evaluator(pull_sock, push_sock, model, accuracy_threshold=0.90, time_limit_s=3600, batch_size=32):
     log("[EVALUATOR]")
 
     # -- load test data  --
-    # _, test_ds = load_mnist()
     _, test_ds = load_cifar10()
 
     test_loader = torch.utils.data.DataLoader(
@@ -545,30 +567,29 @@ def run_evaluator(model, root, comm, accuracy_threshold=0.90, time_limit_s=3600,
     global global_state
     timer = TimeTree(print_func=log)
 
-    serializer = ParamSerializer(model)
+    serializer  = ParamSerializer(model)
     flat_params = np.empty(serializer.n_params, dtype=np.float32)
-    packet_size = serializer.n_params + 1
 
-    test_acc = 0
+    test_acc     = 0
     model_version = 0
-
-    recv_buf = np.empty(packet_size, dtype=np.float32)
-    new_params = False
+    new_params   = False
 
     start_time = time.perf_counter()
     while True:
         # -- drain all parameter pushes from root to get newest version --
         with timer.measure("drain"):
             drained = 0
-            while comm.Iprobe(source=root, tag=Msg.EVAL):
-                comm.Recv(recv_buf, source=root, tag=Msg.EVAL)
-
+            while pull_sock.poll(timeout=0):
+                frames = pull_sock.recv_multipart()
+                # frames: [msg_type_byte, payload]
+                payload     = frames[1] if len(frames) > 1 else b''
+                packet      = np.frombuffer(payload, dtype=np.float32)
+                new_version = int(packet[0])
                 drained += 1
-                new_version = int(recv_buf[0])
 
                 if new_version > model_version:
                     model_version = new_version
-                    flat_params[:] = recv_buf[1:]
+                    flat_params[:] = packet[1:]
                     new_params = True
                 else:
                     log(f"WARNING: received non-monotonic eval version {new_version} (current {model_version}), skipping")
@@ -598,43 +619,61 @@ def run_evaluator(model, root, comm, accuracy_threshold=0.90, time_limit_s=3600,
                         loss = loss_fn(y_pred, y_batch)
                         test_batch_size = X_batch.size(0)
 
-                        total_loss += loss.item()*test_batch_size
+                        total_loss += loss.item() * test_batch_size
                         total_samples += test_batch_size
 
-                test_acc = total_correct/total_samples
-                test_loss = total_loss/total_samples
+                test_acc  = total_correct / total_samples
+                test_loss = total_loss / total_samples
 
             done_time = time.perf_counter() - start_time
-            log('*'*100)
+            log('*' * 100)
             log(f"Evaluation (recv'd after {recv_time:.2f}s, done after {done_time:.2f}s): version {model_version}, accuracy: {test_acc:.2%}, loss: {test_loss:.4f}")
-            log('*'*100)
+            log('*' * 100)
 
             if test_acc >= accuracy_threshold or done_time >= time_limit_s:
-            # if True:
                 log("sending STOP message...")
-                # drain any remaining eval pushes so root does not hold dangling sends
-                while comm.Iprobe(source=0, tag=Msg.EVAL):
-                    comm.Recv(np.empty(packet_size, dtype=np.float32), source=0, tag=Msg.EVAL)
-                comm.Send(np.array([0], dtype=np.int32), dest=0, tag=Msg.STOP)
+                # drain any remaining eval pushes before signalling stop
+                while pull_sock.poll(timeout=0):
+                    pull_sock.recv_multipart()
+                push_sock.send_multipart([bytes([Msg.STOP]), b''])
                 break
 
         else:
-            # log(f"No updated parameters received")
-            time.sleep(0.5)
+            pull_sock.poll(timeout=500)   # wait up to 500 ms for new params
 
     log("evaluator terminating...")
+
+    pull_sock.setsockopt(zmq.LINGER, 0)
+    pull_sock.close()
+    push_sock.setsockopt(zmq.LINGER, 0)
+    push_sock.close()
+
     log("evaluator done")
 
 
-def run_worker(model, parent, comm, n_workers, worker_idx, batch_size=32, n_epochs=1, local_steps=1):
+def run_worker(dealer_sock, model, n_workers, batch_size=32, n_epochs=1, local_steps=1):
 
-    log(f"[WORKER {worker_idx}] parent: {parent}, local_steps: {local_steps}")
+    # -- registration: send hostname, get assigned worker_idx --
+    dealer_sock.send_multipart([bytes([Msg.REGISTER]), hostname.encode()])
+    frames    = dealer_sock.recv_multipart()
+    assert frames[0] == bytes([Msg.ASSIGN])
+    worker_idx = int(np.frombuffer(frames[1], dtype=np.int32)[0])
+
+    # -- receive initial params --
+    frames = dealer_sock.recv_multipart()
+    assert frames[0] == bytes([Msg.PUSH_PARAMS])
+    init_packet   = np.frombuffer(frames[1], dtype=np.float32)
+    model_version = int(init_packet[0])
+
+    log(f"[WORKER {worker_idx}] registered, initial version {model_version}, local_steps: {local_steps}")
+
+    serializer = ParamSerializer(model)
+    serializer.load_params(init_packet[1:])
 
     global global_state
     timer = TimeTree(print_func=log)
 
     # -- load datasets --
-    # train_ds, test_ds = load_mnist()
     train_ds, test_ds = load_cifar10()
 
     train_sampler = torch.utils.data.distributed.DistributedSampler(
@@ -657,24 +696,14 @@ def run_worker(model, parent, comm, n_workers, worker_idx, batch_size=32, n_epoc
     # -- define loss function --
     loss_fn = torch.nn.CrossEntropyLoss()
 
-    # -- pre-allocate buffers --
-    serializer  = ParamSerializer(model)
+    # -- pre-allocate send buffer --
     packet_size = serializer.n_params + 1
-    recv_packet = np.empty(packet_size, dtype=np.float32)
-    grad_buf    = np.empty(packet_size, dtype=np.float32)  # owned send buffer, reused each step
-    stop_buf    = np.empty(1, dtype=np.int32)
+    grad_buf    = np.empty(packet_size, dtype=np.float32)
 
-    param_recv_req = comm.Irecv(recv_packet, source=parent, tag=Msg.PUSH_PARAMS)
-    stop_recv_req = comm.Irecv(stop_buf, source=parent, tag=Msg.STOP)
-    send_req = None
-
-    model_version = -1
     stop_flag = False
-
     epoch = 0
-    # for epoch in range(n_epochs):
+
     while True:
-        # timer.reset()
         log(f"Epoch {epoch + 1}/{n_epochs}")
         with timer.measure("epoch"):
 
@@ -682,29 +711,27 @@ def run_worker(model, parent, comm, n_workers, worker_idx, batch_size=32, n_epoc
             model.train()
 
             with timer.measure("batch"):
-                local_step = 0        # counts micro-steps within the current local window
+                local_step = 0
                 for batch_idx, (X_batch, y_batch) in enumerate(train_loader):
 
-                    # fetch fresh params from PS at the start of each local window
+                    # fetch fresh params from PS at start of each local window
                     if local_step == 0:
                         with timer.measure("wait_recv"):
-                            idx = MPI.Request.Waitany([param_recv_req, stop_recv_req])
+                            # poll blocks until a message arrives
+                            dealer_sock.poll()
+                            frames    = dealer_sock.recv_multipart()
+                            msg_type  = frames[0]
+                            payload   = frames[1] if len(frames) > 1 else b''
 
-                        if idx == MPI.UNDEFINED:
-                            log("UNDEFINED INDEX (this should not happen)")
-                            stop_flag = True
-                            break
-
-                        if idx == 1:
+                        if msg_type == bytes([Msg.STOP]):
                             log("Stop signal received, stopping training loop")
                             stop_flag = True
                             break
 
-                        model_version = int(recv_packet[0])
-                        serializer.load_params(recv_packet[1:])
-
-                        param_recv_req = comm.Irecv(recv_packet, source=parent, tag=Msg.PUSH_PARAMS)
-
+                        assert msg_type == bytes([Msg.PUSH_PARAMS])
+                        packet = np.frombuffer(payload, dtype=np.float32)
+                        model_version = int(packet[0])
+                        serializer.load_params(packet[1:])
                         model.zero_grad()
 
                     with timer.measure("step"):
@@ -715,7 +742,7 @@ def run_worker(model, parent, comm, n_workers, worker_idx, batch_size=32, n_epoc
 
                         predicted = torch.argmax(y_pred, 1)
                         correct = (predicted == y_batch).sum().item()
-                        train_accuracy = correct/X_batch.size(0)
+                        train_accuracy = correct / X_batch.size(0)
 
                         # accumulate gradients across local steps
                         loss.backward()
@@ -726,20 +753,11 @@ def run_worker(model, parent, comm, n_workers, worker_idx, batch_size=32, n_epoc
 
                     # push accumulated gradients after local_steps micro-steps
                     if local_step == local_steps:
-                        if send_req is not None:
-                            with timer.measure("wait_send"):
-                                send_req[0].Wait()
-
-                        global_state["n_parent_send_reqs"] = 0
-
                         with timer.measure("serialize_grads"):
                             grad_buf[0] = model_version
                             serializer.flatten_grads_into(grad_buf[1:])
 
-                        req = comm.Isend(grad_buf, dest=parent, tag=Msg.PUSH_GRADS)
-                        send_req = (req, grad_buf, parent)
-
-                        global_state["n_parent_send_reqs"] = 1
+                        dealer_sock.send_multipart([bytes([Msg.PUSH_GRADS]), grad_buf.tobytes()])
                         local_step = 0
 
                     if (batch_idx + 1) % 50 == 0:
@@ -754,12 +772,9 @@ def run_worker(model, parent, comm, n_workers, worker_idx, batch_size=32, n_epoc
 
                 # flush any partially-accumulated gradients at epoch end
                 if not stop_flag and local_step > 0:
-                    if send_req is not None:
-                        send_req[0].Wait()
                     grad_buf[0] = model_version
                     serializer.flatten_grads_into(grad_buf[1:])
-                    req = comm.Isend(grad_buf, dest=parent, tag=Msg.PUSH_GRADS)
-                    send_req = (req, grad_buf, parent)
+                    dealer_sock.send_multipart([bytes([Msg.PUSH_GRADS]), grad_buf.tobytes()])
 
         timer.print_tree()
 
@@ -769,19 +784,23 @@ def run_worker(model, parent, comm, n_workers, worker_idx, batch_size=32, n_epoc
         epoch += 1
 
     log("worker terminating...")
-
-    cancel_recv_req(param_recv_req)
-
-    log("safe waiting send req")
-    if send_req is not None:
-        req, buf, dst = send_req
-        safe_wait_send_req(req)
-
+    dealer_sock.setsockopt(zmq.LINGER, 0)
+    dealer_sock.close()
     log("worker done cleaning up")
 
 
 def main():
-    print(f"({hostname}) Rank {world_rank}/{world_size - 1}")
+    global device_role, global_start_time
+
+    topology  = build_topology_from_yaml(config_file)
+    role_cfg  = determine_role(hostname, topology)
+    role      = role_cfg["role"]
+    training  = topology["training"]
+
+    device_role       = role
+    global_start_time = time.perf_counter()
+
+    log(f"({hostname}) starting as {role.name}")
 
     # model = LeNet()
     # model = LeNetCIFAR()
@@ -790,64 +809,105 @@ def main():
     # model = AlexNetCIFAR()
     model.apply(disable_state)
 
-    topology  = build_topology_from_yaml(config_file, world_size)
-    training  = topology["training"]
     serializer = ParamSerializer(model)
-
-    role, parent, children, sync = get_role(world_rank, topology)
-
-    global device_role
-    device_role = role
-
-    n_workers = len(topology.get("workers"))
-    worker_comm = world.Create(world.Get_group().Incl(topology.get("workers")))
+    ctx = zmq.Context()
 
     collect_metrics = threading.Event()
-    monitor_thread = threading.Thread(target=collect_sys_metrics, args=(collect_metrics,))
+    monitor_thread  = threading.Thread(target=collect_sys_metrics, args=(collect_metrics,))
     monitor_thread.start()
     collect_metrics.set()
 
     remove_bw_cpu_limits()
+
+    base_port = topology["base_port"]
+    eval_host = topology["eval_host"]
+    eval_port = topology["eval_port"]
+    root_addr = topology["root_addr"]
+
     match role:
         case Role.ROOT_PS:
+            router = ctx.socket(zmq.ROUTER)
+            router.bind(f"tcp://*:{base_port}")
+            stop_pull = ctx.socket(zmq.PULL)
+            stop_pull.bind(f"tcp://*:{base_port + 1}")
+            eval_push = ctx.socket(zmq.PUSH)
+            eval_push.connect(f"tcp://{eval_host}:{eval_port}")
             ParameterServer(
-                model=model, children=children, comm=world, sync=sync,
-                serializer=serializer, init_params=init_params,
-                parent=None, evaluator=world_size - 1,
+                model=model,
+                children_hostnames=role_cfg["children_hostnames"],
+                sync=role_cfg["sync"],
+                router_sock=router,
+                stop_sock=stop_pull,
+                eval_push_sock=eval_push,
+                serializer=serializer,
+                init_params=init_params,
+                parent=None,
                 lr=training["learning_rate"],
                 eval_interval=training["eval_interval"],
-                global_state=global_state, log=log,
+                global_state=global_state,
+                log=log,
             ).run()
 
         case Role.EDGE_PS:
+            router = ctx.socket(zmq.ROUTER)
+            router.bind(f"tcp://*:{base_port}")
+            dealer = ctx.socket(zmq.DEALER)
+            dealer.setsockopt(zmq.IDENTITY, hostname.encode())
+            dealer.connect(f"tcp://{role_cfg['parent_addr']}:{base_port}")
             ParameterServer(
-                model=model, children=children, comm=world, sync=sync,
-                serializer=serializer, init_params=init_params,
-                parent=parent,
+                model=model,
+                children_hostnames=role_cfg["children_hostnames"],
+                sync=role_cfg["sync"],
+                router_sock=router,
+                dealer_sock=dealer,
+                serializer=serializer,
+                init_params=init_params,
+                parent=role_cfg["parent_addr"],
                 lr=training["learning_rate"],
                 eval_interval=training["eval_interval"],
-                global_state=global_state, log=log,
+                global_state=global_state,
+                log=log,
             ).run()
 
         case Role.WORKER:
-            worker_idx = worker_comm.Get_rank()
-            apply_bw_cpu_limits(topology.get("bw_cpu_limits").get(world_rank))
-            run_worker(model, parent, world, n_workers, worker_idx,
-                       batch_size=training["batch_size"],
-                       n_epochs=training["n_epochs"],
-                       local_steps=training["local_steps"])
+            spec = role_cfg
+            apply_bw_cpu_limits([spec.get("bw"), spec.get("cpu")])
+            all_workers = [
+                w for edge in topology.get("edge_servers_raw", [])
+                for w in edge.get("workers", [])
+            ] or list(topology.get("worker_specs", {}).keys())
+            n_workers = len(topology["worker_specs"])
+            dealer = ctx.socket(zmq.DEALER)
+            dealer.setsockopt(zmq.IDENTITY, hostname.encode())
+            dealer.connect(f"tcp://{spec['parent_addr']}:{base_port}")
+            run_worker(
+                dealer_sock=dealer,
+                model=model,
+                n_workers=n_workers,
+                batch_size=training["batch_size"],
+                n_epochs=training["n_epochs"],
+                local_steps=training["local_steps"],
+            )
 
         case Role.EVAL:
-            run_evaluator(model, 0, world,
-                          accuracy_threshold=topology.get("eval_accuracy_threshold"),
-                          time_limit_s=topology.get("eval_time_limit_s"),
-                          batch_size=training["batch_size"])
+            pull = ctx.socket(zmq.PULL)
+            pull.bind(f"tcp://*:{eval_port}")
+            push = ctx.socket(zmq.PUSH)
+            push.connect(f"tcp://{root_addr}:{base_port + 1}")
+            run_evaluator(
+                pull_sock=pull,
+                push_sock=push,
+                model=model,
+                accuracy_threshold=topology["eval_accuracy_threshold"],
+                time_limit_s=topology["eval_time_limit_s"],
+                batch_size=training["batch_size"],
+            )
 
     log("returned from role function")
-    world.Barrier()
     collect_metrics.clear()
     monitor_thread.join()
     remove_bw_cpu_limits()
+    ctx.term()
 
 
 if __name__ == "__main__":
