@@ -1,36 +1,55 @@
-bind_addr: "192.168.1.1"   # root PS address
-base_port: 5550             # root PS binds on this port; base_port+1 used for STOP (from evaluator)
-
-sync: false
-
-eval:
-  host: "192.168.1.5"
-  port: 5560
-  accuracy_threshold: 0.90
-  time_limit_s: 3600
-
+# Host is an SSH destination, not a role/registration identity.
+# Unthrottled example: cpu/bw limits are rejected until resource ownership is repaired.
+nodes:
+  - id: root
+    role: root_ps
+    host: 192.168.1.1
+    endpoint: tcp://192.168.1.1:5550
+    bind_endpoint: tcp://*:5550
+    stop_endpoint: tcp://192.168.1.1:5551
+    stop_bind_endpoint: tcp://*:5551
+    sync: true
+  - id: edge-a
+    role: edge_ps
+    host: 192.168.1.2
+    endpoint: tcp://192.168.1.2:5550
+    bind_endpoint: tcp://*:5550
+    parent: root
+    sync: true
+  - id: edge-b
+    role: edge_ps
+    host: 192.168.1.3
+    endpoint: tcp://192.168.1.3:5550
+    bind_endpoint: tcp://*:5550
+    parent: root
+    sync: true
+  - id: evaluator
+    role: eval
+    host: 192.168.1.5
+    endpoint: tcp://192.168.1.5:5560
+    bind_endpoint: tcp://*:5560
+  - id: worker-1
+    role: worker
+    host: pi-worker-1
+    parent: edge-a
+  - id: worker-2
+    role: worker
+    host: pi-worker-2
+    parent: edge-a
+  - id: worker-3
+    role: worker
+    host: pi-worker-3
+    parent: edge-b
+  - id: worker-4
+    role: worker
+    host: pi-worker-4
+    parent: edge-b
 training:
   learning_rate: 0.01
   batch_size: 32
   n_epochs: 1
   eval_interval: 200
-  local_steps: 1    # micro-steps per PS sync; >1 reduces communication frequency
-
-edge_servers:
-  - sync: true
-    bind_addr: "192.168.1.2"
-    workers:
-      - hostname: pi-worker-1
-        cpu: 100
-      - hostname: pi-worker-2
-        cpu: 100
-
-  - sync: true
-    bind_addr: "192.168.1.3"
-    workers:
-      - hostname: pi-worker-3
-        cpu: 30
-        bw: 10mbit
-      - hostname: pi-worker-4
-        cpu: 30
-        bw: 10mbit
+  local_steps: 1
+eval:
+  accuracy_threshold: 0.90
+  time_limit_s: 3600

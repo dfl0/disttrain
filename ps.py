@@ -1,346 +1,246 @@
+"""Synchronous parameter servers: edges sum contributions, only the root updates."""
 import time
 import numpy as np
 import zmq
 
-from comm import Msg
+from protocol import (Msg, MAX_VERSION, decode_packet, encode_packet, encode_assignment,
+                      decode_assignment, encode_version, decode_version)
+from transport import send_message, receive_message, close_sockets, drain_socket
 from timetree import TimeTree
 
 
 class ParameterServer:
-    """
-    Parameter server for both root and edge (intermediate) roles.
-
-    Pass parent=None to create a root PS. Pass a parent address string to create
-    an edge PS. Uses ZMQ ROUTER (facing children) and optionally DEALER (facing
-    parent PS) sockets.
-
-    Call run() to enter the training loop. It blocks until a STOP signal
-    propagates through the tree.
-    """
-
-    def __init__(
-        self,
-        model,
-        children_hostnames,
-        sync,
-        router_sock,
-        serializer,
-        init_params,
-        parent=None,
-        dealer_sock=None,
-        stop_sock=None,
-        eval_push_sock=None,
-        lr=0.01,
-        eval_interval=200,
-        global_state=None,
-        log=None,
-    ):
-        self._serializer     = serializer
-        self._init_params_fn = init_params
-
-        self.model              = model
-        self.children_hostnames = children_hostnames  # ordered list of child hostnames
-        self.sync               = sync
-        self.parent             = parent
-        self.lr                 = lr
-        self.eval_interval      = eval_interval
-        self.global_state       = global_state or {}
-        self.log                = log or print
-
-        self.is_root = (parent is None)
-
-        # ZMQ sockets
-        self._router    = router_sock
-        self._dealer    = dealer_sock       # edge only
-        self._stop_sock = stop_sock         # root only (PULL from evaluator)
-        self._eval_push = eval_push_sock    # root only (PUSH to evaluator)
-
-        # parameter buffers
-        self.flat_params  = np.empty(serializer.n_params, dtype=np.float32)
+    def __init__(self, model, children_ids, sync, router_sock, serializer, init_params,
+                 *, child_ranks, parent=None, dealer_sock=None, stop_sock=None,
+                 eval_push_sock=None, lr=0.01, eval_interval=200, global_state=None,
+                 log=print, node_id=None, lifecycle=None, max_rounds=None, log_interval=10):
+        if sync is not True:
+            raise ValueError('only synchronous root-only optimization is supported')
+        if not children_ids or len(set(children_ids)) != len(children_ids):
+            raise ValueError('server requires nonempty unique children')
+        if set(child_ranks) != set(children_ids):
+            raise ValueError('assignments must cover exactly the configured children')
+        if any(type(rank) is not int or rank < -1 for rank in child_ranks.values()):
+            raise ValueError('child assignments must be global ranks or -1 for edges')
+        if parent is not None and (node_id is None or dealer_sock is None):
+            raise ValueError('edge requires a node ID and parent socket')
+        if not np.isfinite(lr) or lr <= 0 or type(eval_interval) is not int or eval_interval <= 0:
+            raise ValueError('learning rate and evaluation interval must be positive')
+        self.model, self._serializer, self._init_params_fn = model, serializer, init_params
+        self.children_ids, self.child_ranks = tuple(children_ids), dict(child_ranks)
+        self.parent, self.node_id = parent, node_id
+        self.is_root = parent is None
+        if max_rounds is not None and (type(max_rounds) is not int or max_rounds <= 0):
+            raise ValueError("max_rounds must be a positive integer or None")
+        if type(log_interval) is not int or log_interval <= 0:
+            raise ValueError("log_interval must be a positive integer")
+        self.log_interval = log_interval
+        self.total_samples = 0
+        self.training_started = time.perf_counter()
+        self.last_logged_version = -1
+        self.max_rounds = max_rounds
+        self.lr, self.eval_interval = lr, eval_interval
+        self.lifecycle = lifecycle
+        self.send = send_message if lifecycle is None else lifecycle.send
+        self.receive = receive_message if lifecycle is None else lifecycle.receive
+        self.log = log
+        self.global_state = {} if global_state is None else global_state
+        self._router, self._dealer = router_sock, dealer_sock
+        self._stop_sock, self._eval_push = stop_sock, eval_push_sock
+        self.flat_params = np.empty(serializer.n_params, dtype=np.float32)
         serializer.flatten_params_into(self.flat_params)
-        self.packet_size  = serializer.n_params + 1
-        self._send_buf    = np.empty(self.packet_size, dtype=np.float32)
-        # anchor_params: edge PS tracks param state at start of each aggregation window
-        self.anchor_params = np.empty_like(self.flat_params)
-
-        # identity maps — populated during registration in _init_params
-        self._identity_to_idx = {}   # zmq identity bytes → child_idx (int)
-        self._idx_to_identity = {}   # child_idx (int) → zmq identity bytes
-
-        # counters and state
-        self.model_version   = 0
-        self.n_updates       = 0
-        self.active_children = len(children_hostnames)
-        self.children_done   = set()
-        self.eval_stopped    = False
-
-        # precomputed update scaling and scratch buffer
-        self._lr_scale   = lr / max(1, len(children_hostnames))
-        self._update_buf = np.empty_like(self.flat_params)
-
-        self.timer = TimeTree(print_func=self.log)
-
-    # ------------------------------------------------------------------
-    # Public entry point
-    # ------------------------------------------------------------------
+        self.gradient_sum = np.zeros_like(self.flat_params)
+        self.sample_count = 0
+        self.version = 0
+        self.received = set()
+        self.finished = set()
+        self.registered = set()
+        self.waiting_for_parent = False
+        self.stopped = False
+        self.timer = TimeTree(print_func=log)
 
     def run(self):
-        self.log(f"[{'SYNC' if self.sync else 'ASYNC'} {'PS' if self.is_root else f'EDGE PS, parent: {self.parent}'}]")
-        self._init_params()
-        self.log("Starting training...")
-        self._event_loop()
-        self._shutdown()
-        self.timer.print_tree()
-
-    # ------------------------------------------------------------------
-    # Setup: registration and initial parameter broadcast
-    # ------------------------------------------------------------------
+        try:
+            if self.lifecycle:
+                self.lifecycle.ready()
+            self._init_params()
+            if self.lifecycle:
+                self.lifecycle.begin_round()
+            self.training_started = time.perf_counter()
+            if self.is_root:
+                self.log('[TRAIN] ready; waiting for first round')
+            self._event_loop()
+        finally:
+            self._shutdown()
 
     def _init_params(self):
         if self.is_root:
             self.model.apply(self._init_params_fn)
             self._serializer.flatten_params_into(self.flat_params)
-            self.model_version = 0
         else:
-            # register with parent and receive initial params
-            self._dealer.send_multipart([
-                bytes([Msg.REGISTER]),
-                _hostname().encode(),
-            ])
-            # wait for ASSIGN (worker_idx, not used by PS but kept for protocol symmetry)
-            frames = self._dealer.recv_multipart()
-            # frames: [msg_type, worker_idx_bytes]
-            # then wait for initial PUSH_PARAMS
-            frames = self._dealer.recv_multipart()
-            assert frames[0] == bytes([Msg.PUSH_PARAMS])
-            packet = np.frombuffer(frames[1], dtype=np.float32)
-            self.model_version = int(packet[0])
-            self.flat_params[:] = packet[1:]
-            self.anchor_params[:] = self.flat_params
-
-        # wait for all children to register
-        registered = {}
-        while len(registered) < len(self.children_hostnames):
-            frames = self._router.recv_multipart()
-            identity, msg_type = frames[0], frames[1]
-            hostname = frames[2].decode() if len(frames) > 2 else ""
-            assert msg_type == bytes([Msg.REGISTER]), f"expected REGISTER, got {msg_type}"
-            idx = self.children_hostnames.index(hostname)
-            registered[identity] = idx
-            self._router.send_multipart([
-                identity,
-                bytes([Msg.ASSIGN]),
-                np.int32(idx).tobytes(),
-            ])
-
-        self._identity_to_idx = registered
-        self._idx_to_identity = {v: k for k, v in registered.items()}
-
-        # send initial params to all registered children
-        self._pack_send_buf()
-        payload = self._send_buf.tobytes()
-        for identity in self._identity_to_idx:
-            self._router.send_multipart([identity, bytes([Msg.PUSH_PARAMS]), payload])
-
-    # ------------------------------------------------------------------
-    # Event loop
-    # ------------------------------------------------------------------
+            self.send(self._dealer, Msg.REGISTER, self.node_id.encode())
+            _, kind, payload = self.receive(self._dealer)
+            if kind != bytes([Msg.ASSIGN]) or decode_assignment(payload) != -1:
+                raise ValueError('edge expected its registration acknowledgement')
+            _, kind, payload = self.receive(self._dealer)
+            if kind != bytes([Msg.PUSH_PARAMS]):
+                raise ValueError('edge expected initial root snapshot')
+            version, _, params = decode_packet(payload, self.flat_params.size)
+            if version != 0:
+                raise ValueError('initial snapshot must be version zero')
+            self.flat_params[:] = params
+        while len(self.registered) < len(self.children_ids):
+            identity, kind, payload = self.receive(self._router, routed=True)
+            if kind != bytes([Msg.REGISTER]) or identity != payload:
+                raise ValueError('registration type or identity/payload mismatch')
+            child_id = identity.decode('utf-8')
+            if child_id not in self.child_ranks or child_id in self.registered:
+                raise ValueError(f'unknown or duplicate registration: {child_id}')
+            self.registered.add(child_id)
+            self.send(self._router, Msg.ASSIGN, encode_assignment(self.child_ranks[child_id]), identity=identity)
+        self._broadcast_snapshot()
 
     def _event_loop(self):
         poller = zmq.Poller()
         poller.register(self._router, zmq.POLLIN)
-        if not self.is_root:
-            poller.register(self._dealer, zmq.POLLIN)
-        if self.is_root:
-            poller.register(self._stop_sock, zmq.POLLIN)
-
-        self.timer.reset()
-        with self.timer.measure("train"):
-            while True:
-                with self.timer.measure("wait") as t:
-                    socks = dict(poller.poll())
-
-                if self._router in socks:
-                    frames = self._router.recv_multipart()
-                    identity  = frames[0]
-                    msg_type  = frames[1]
-                    payload   = frames[2] if len(frames) > 2 else b''
-
-                    if msg_type == bytes([Msg.PUSH_GRADS]):
-                        child_idx = self._identity_to_idx[identity]
-                        t["tag"] = self.children_hostnames[child_idx]
-                        self._dispatch_child_grad(child_idx, identity, payload)
-                        self._update_global_state()
-
-                if not self.is_root and self._dealer in socks:
-                    frames    = self._dealer.recv_multipart()
-                    msg_type  = frames[0]
-                    payload   = frames[1] if len(frames) > 1 else b''
-
-                    if msg_type == bytes([Msg.PUSH_PARAMS]):
-                        t["tag"] = self.parent
-                        self._dispatch_parent_push(payload)
-                        self._update_global_state()
-                    elif msg_type == bytes([Msg.STOP]):
-                        t["tag"] = "stop"
+        control = self._stop_sock if self.is_root else self._dealer
+        if control is not None:
+            poller.register(control, zmq.POLLIN)
+        with self.timer.measure('train'):
+            while not self.stopped:
+                sockets = (self.lifecycle.wait([s for s in (self._router, control) if s is not None])
+                           if self.lifecycle else dict(poller.poll()))
+                # Observe termination/parent response before more child traffic.
+                if control in sockets:
+                    _, kind, payload = self.receive(control)
+                    if kind == bytes([Msg.STOP]):
                         self._dispatch_stop()
                         break
+                    if self.is_root or kind != bytes([Msg.PUSH_PARAMS]):
+                        raise ValueError('unexpected control message')
+                    self._dispatch_parent_push(payload)
+                if self._router in sockets:
+                    identity, kind, payload = self.receive(self._router, routed=True)
+                    child_id = identity.decode('utf-8')
+                    if child_id not in self.registered:
+                        raise ValueError('message from an unregistered child')
+                    if kind == bytes([Msg.PUSH_GRADS]):
+                        self._accept_contribution(child_id, payload)
+                    elif kind == bytes([Msg.DONE]):
+                        self._accept_done(child_id, payload)
+                    else:
+                        raise ValueError('unexpected child message')
 
-                if self.is_root and self._stop_sock in socks:
-                    self._stop_sock.recv()   # consume; payload unused
-                    t["tag"] = "stop"
-                    self._dispatch_stop()
-                    break
+    def _accept_contribution(self, child_id, payload):
+        if (self.stopped or child_id not in self.registered or child_id in self.received
+                or self.finished or self.waiting_for_parent):
+            raise ValueError('unknown, duplicate or out-of-phase contribution')
+        version, count, gradients = decode_packet(payload, self.flat_params.size, gradients=True)
+        if version != self.version or self.sample_count + count > MAX_VERSION:
+            raise ValueError('wrong round/version or sample-count overflow')
+        # Validate the prospective sum before committing any round state.
+        with np.errstate(over='ignore', invalid='ignore'):
+            combined = self.gradient_sum + gradients
+        if not np.isfinite(combined).all():
+            raise ValueError('gradient sum overflow')
+        self.gradient_sum[:] = combined
+        self.sample_count += count
+        self.received.add(child_id)
+        if len(self.received) == len(self.children_ids):
+            if self.is_root:
+                self._commit_root_round()
+            else:
+                self._forward_edge_round()
 
-    # ------------------------------------------------------------------
-    # Dispatch handlers
-    # ------------------------------------------------------------------
+    def _commit_root_round(self):
+        if self.version == MAX_VERSION:
+            raise ValueError('root version overflow')
+        with np.errstate(over='ignore', invalid='ignore'):
+            updated = self.flat_params - self.lr * (self.gradient_sum / self.sample_count)
+        if not np.isfinite(updated).all():
+            raise ValueError('non-finite root update')
+        self.flat_params[:] = updated
+        self.version += 1
+        self.total_samples += self.sample_count
+        if self.version == 1 or self.version % self.log_interval == 0:
+            self._log_progress()
+        self._reset_round()
+        if self.max_rounds is not None and self.version >= self.max_rounds:
+            self.log(f'max_rounds reached at version {self.version}; evaluating final model')
+            self._finish_training()
+            return  # Do not release another round while final evaluation runs.
+        self._broadcast_snapshot()
+        if self.version % self.eval_interval == 0:
+            self._push_eval()
 
-    def _dispatch_stop(self):
-        self.eval_stopped = True
-        self.log("Stop signal received, propagating to children")
-        for identity in self._identity_to_idx:
-            self._router.send_multipart([identity, bytes([Msg.STOP]), b''])
+    def _forward_edge_round(self):
+        self.send(self._dealer, Msg.PUSH_GRADS,
+                     encode_packet(self.version, self.gradient_sum, self.sample_count))
+        self.waiting_for_parent = True
+        # Retain the completed round until the matching parent response arrives.
 
     def _dispatch_parent_push(self, payload):
-        packet = np.frombuffer(payload, dtype=np.float32)
-        self.model_version = int(packet[0])
-        self.flat_params[:] = packet[1:]
-        self.anchor_params[:] = self.flat_params
+        version, _, params = decode_packet(payload, self.flat_params.size)
+        if self.is_root or not self.waiting_for_parent or self.finished or version != self.version + 1:
+            raise ValueError('unexpected parent snapshot or wrong version')
+        self.flat_params[:] = params
+        self.version = version
+        self.waiting_for_parent = False
+        self._reset_round()
+        self._broadcast_snapshot()
 
-        if self.sync:
-            self._pack_send_buf()
-            wire_payload = self._send_buf.tobytes()
-            with self.timer.measure("send_params") as ts:
-                for identity, child_idx in self._identity_to_idx.items():
-                    self._router.send_multipart([identity, bytes([Msg.PUSH_PARAMS]), wire_payload])
-                    ts["tag"] = self.children_hostnames[child_idx]
+    def _reset_round(self):
+        self.gradient_sum.fill(0)
+        self.sample_count = 0
+        self.received.clear()
 
-    def _dispatch_child_grad(self, child_idx, identity, payload):
-        packet = np.frombuffer(payload, dtype=np.float32)
-        grad_version = int(packet[0])
-        grads        = packet[1:]
+    def _broadcast_snapshot(self):
+        if self.lifecycle and self.version > 0:
+            self.lifecycle.begin_round()
+        payload = encode_packet(self.version, self.flat_params)
+        for child_id in self.children_ids:
+            self.send(self._router, Msg.PUSH_PARAMS, payload, identity=child_id.encode())
 
-        staleness = self.model_version - grad_version
-        if staleness > 0:
-            child_host = self.children_hostnames[child_idx]
-            self.log(f"stale grad from {child_host}: version {grad_version}, current {self.model_version}, staleness {staleness}")
-
-        np.multiply(grads, self._lr_scale, out=self._update_buf)
-        self.flat_params -= self._update_buf
-        self.n_updates   += 1
-
-        self._apply_sync_or_async(child_idx, identity, grad_version)
-
-    # ------------------------------------------------------------------
-    # Update policy
-    # ------------------------------------------------------------------
-
-    def _apply_sync_or_async(self, child_idx, identity, grad_version):
-        if self.sync:
-            self.children_done.add(child_idx)
-            if len(self.children_done) < self.active_children:
-                return
-
-            # all children have reported — commit the round
-            self._increment_version()
-            self._pack_send_buf()
-            wire_payload = self._send_buf.tobytes()
-
-            with self.timer.measure("send_params") as ts:
-                for done_idx in self.children_done:
-                    ident = self._idx_to_identity[done_idx]
-                    self._router.send_multipart([ident, bytes([Msg.PUSH_PARAMS]), wire_payload])
-                    ts["tag"] = self.children_hostnames[done_idx]
-
-            if not self.is_root:
-                self._send_delta_to_parent()
-
-            self.children_done.clear()
-
+    def _accept_done(self, child_id, payload):
+        if (self.stopped or child_id not in self.registered or child_id in self.finished
+                or self.received or self.waiting_for_parent or decode_version(payload) != self.version):
+            raise ValueError('invalid completion or unequal worker round counts')
+        self.finished.add(child_id)
+        if len(self.finished) == len(self.children_ids):
             if self.is_root:
-                self._maybe_push_eval()
-
-        else:  # async
-            self._increment_version()
-            self._pack_send_buf()
-
-            with self.timer.measure("send_params") as ts:
-                self._router.send_multipart([identity, bytes([Msg.PUSH_PARAMS]), self._send_buf.tobytes()])
-                ts["tag"] = self.children_hostnames[child_idx]
-
-            if self.is_root:
-                self._maybe_push_eval()
+                self._finish_training()
             else:
-                if self.n_updates >= max(1, self.active_children // 2):
-                    self._send_delta_to_parent()
-                    self.anchor_params[:] = self.flat_params
-                    self.n_updates = 0
+                self.send(self._dealer, Msg.DONE, encode_version(self.version))
+                self.waiting_for_parent = True  # only STOP is valid now
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
+    def _log_progress(self):
+        elapsed = time.perf_counter() - self.training_started
+        self.log(f'[TRAIN] round={self.version} samples={self.total_samples} elapsed={elapsed:.2f}s')
+        self.last_logged_version = self.version
 
-    def _increment_version(self):
-        self.model_version += 1
-        assert self.model_version < 2**24, \
-            f"model_version {self.model_version} exceeds float32 precision"
+    def _finish_training(self):
+        if self.last_logged_version != self.version:
+            self._log_progress()
+        self._push_eval()
+        if self.lifecycle:
+            self.lifecycle.wait_evaluation(self.version)
+        self._dispatch_stop()
 
-    def _pack_send_buf(self):
-        self._send_buf[0] = self.model_version
-        self._send_buf[1:] = self.flat_params
+    def _push_eval(self):
+        if self._eval_push is not None:
+            self.send(self._eval_push, Msg.EVAL, encode_packet(self.version, self.flat_params))
 
-    def _send_delta_to_parent(self):
-        self._send_buf[0] = self.model_version
-        np.subtract(self.anchor_params, self.flat_params, out=self._send_buf[1:])
-        with self.timer.measure("send_params") as ts:
-            self._dealer.send_multipart([bytes([Msg.PUSH_GRADS]), self._send_buf.tobytes()])
-            ts["tag"] = self.parent
-
-    def _maybe_push_eval(self):
-        if self.eval_stopped:
-            return
-        if self.model_version % self.eval_interval != 0:
-            return
-        self.log(f"sending params to evaluator, version: {self.model_version}")
-        with self.timer.measure("send_params") as ts:
-            self._eval_push.send_multipart([bytes([Msg.EVAL]), self._send_buf.tobytes()])
-            ts["tag"] = "eval"
-
-    def _update_global_state(self):
-        # no send-queue depth to report with ZMQ; keep dict keys for metrics thread compatibility
-        gs = self.global_state
-        gs["n_child_send_reqs"]  = 0
-        gs["n_parent_send_reqs"] = 0
-        gs["send_reqs_children"] = []
-
-    # ------------------------------------------------------------------
-    # Shutdown
-    # ------------------------------------------------------------------
+    def _dispatch_stop(self):
+        self.stopped = True
+        if self.lifecycle:
+            return  # Runtime coordinates STOP/ACK over the independent control channel.
+        for child_id in self.children_ids:
+            self.send(self._router, Msg.STOP, identity=child_id.encode())
+        if self.is_root and self._eval_push is not None:
+            self.send(self._eval_push, Msg.STOP)
 
     def _shutdown(self):
-        role_name = "root ps" if self.is_root else "edge ps"
-        self.log(f"{role_name} terminating...")
-
-        # drain any residual PUSH_GRADS with a 2s timed window
-        poller = zmq.Poller()
-        poller.register(self._router, zmq.POLLIN)
-        deadline = time.perf_counter() + 2.0
-        while time.perf_counter() < deadline:
-            remaining_ms = int((deadline - time.perf_counter()) * 1000)
-            if not poller.poll(timeout=max(0, remaining_ms)):
-                break
-            self._router.recv_multipart()
-
-        # set LINGER=0 on all sockets so context.term() doesn't hang
-        for sock in filter(None, [self._router, self._dealer,
-                                   self._stop_sock, self._eval_push]):
-            sock.setsockopt(zmq.LINGER, 0)
-            sock.close()
-
-        self.log(f"{role_name} done cleaning up")
-
-
-def _hostname():
-    import socket
-    return socket.gethostname()
+        # Existing best-effort transport cleanup; acknowledged shutdown is separate.
+        if self.lifecycle is None:
+            drain_socket(self._router, seconds=2.0)
+        close_sockets(self._router, self._dealer, self._stop_sock, self._eval_push)
