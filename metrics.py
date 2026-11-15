@@ -1,4 +1,5 @@
 """Write node metrics to CSV in a background thread."""
+from contextlib import contextmanager
 import csv
 from pathlib import Path
 import queue
@@ -6,6 +7,9 @@ import threading
 import time
 
 SCHEMAS = {
+    'clock_origins': ('name', 'monotonic_ns', 'uncertainty_ns'),
+    'clock_calibration': ('node', 'phase', 'local_ns', 'root_ns', 'uncertainty_ns'),
+    'spans': ('operation', 'track', 'start_ns', 'end_ns', 'status', 'version', 'request', 'peer'),
     'updates': ('elapsed', 'version', 'samples', 'contributions', 'aggregate_samples',
                 'aggregate_contributions', 'staleness_weighted_sum', 'staleness_max'),
     'evaluations': ('version', 'samples', 'root_elapsed', 'received', 'done', 'accuracy', 'loss', 'eval_samples'),
@@ -23,11 +27,13 @@ SCHEMAS = {
 
 
 class MetricsRecorder:
-    def __init__(self, directory, *, queue_size=4096, flush_s=1.0, update_every=1, measure_overhead=True):
+    def __init__(self, directory, *, queue_size=4096, flush_s=1.0, update_every=1, measure_overhead=True, trace_duration_s=0):
         if type(queue_size) is not int or queue_size <= 0 or flush_s <= 0:
             raise ValueError('metric queue size and flush interval must be positive')
         if type(update_every) is not int or update_every <= 0:
             raise ValueError('update_every must be a positive integer')
+        self.trace_duration_ns = int(trace_duration_s * 1_000_000_000)
+        self.trace_deadline_ns = None
         self.update_every = update_every
         self.measure_overhead = measure_overhead
         self.last_update = None
@@ -46,6 +52,29 @@ class MetricsRecorder:
         self.recording_elapsed = None
         self.thread = threading.Thread(target=self._write, name='disttrain-csv', daemon=True)
         self.thread.start()
+
+    def clock_origin(self, name, counter_origin):
+        """Map an existing perf_counter origin to the trace monotonic clock."""
+        before = time.monotonic_ns()
+        counter = time.perf_counter()
+        after = time.monotonic_ns()
+        origin = (before + after) // 2 - round((counter - counter_origin) * 1e9)
+        self.record('clock_origins', name, origin, (after - before + 1) // 2)
+
+    def begin_span(self):
+        """Capture operations starting in the first trace_duration_s of activity."""
+        if not self.trace_duration_ns:
+            return None
+        now = time.monotonic_ns()
+        if self.trace_deadline_ns is None:
+            self.trace_deadline_ns = now + self.trace_duration_ns
+        return now if now < self.trace_deadline_ns else None
+
+    def end_span(self, started, operation, *, track='main', status='complete',
+                 version=None, request=None, peer=None):
+        if started is not None:
+            ended = time.monotonic_ns()
+            self.record('spans', operation, track, started, ended, status, version, request, peer)
 
     def check(self):
         if self.error is not None:
@@ -160,3 +189,15 @@ class MetricsRecorder:
             if self.thread.is_alive():
                 raise TimeoutError('metric writer did not finish within 10 seconds')
         self.check()
+
+
+@contextmanager
+def trace_span(recorder, operation, **fields):
+    started = recorder.begin_span() if recorder else None
+    status = 'interrupted'
+    try:
+        yield
+        status = 'complete'
+    finally:
+        if started is not None:
+            recorder.end_span(started, operation, status=status, **fields)

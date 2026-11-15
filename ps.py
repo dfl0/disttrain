@@ -6,7 +6,7 @@ import zmq
 from protocol import (Msg, MAX_VERSION, decode_packet, encode_packet, encode_assignment,
                       decode_assignment, encode_version, decode_version, encode_evaluation)
 from transport import send_message, receive_message, close_sockets, drain_socket
-from timetree import TimeTree
+from metrics import trace_span
 
 
 class ParameterServer:
@@ -14,9 +14,10 @@ class ParameterServer:
     gradient_message = Msg.PUSH_GRADS
     snapshot_message = Msg.PUSH_PARAMS
     done_message = Msg.DONE
+
     def __init__(self, model, children_ids, sync, router_sock, serializer, init_params,
                  *, child_ranks, parent=None, dealer_sock=None, stop_sock=None,
-                 eval_push_sock=None, lr=0.01, eval_interval=200, global_state=None,
+                 eval_push_sock=None, lr=0.01, eval_interval=200,
                  log=print, node_id=None, lifecycle=None, max_rounds=None, log_interval=10, recorder=None, worker_count=None):
         if sync is not self.synchronous:
             raise ValueError('server implementation does not match configured mode')
@@ -40,6 +41,7 @@ class ParameterServer:
             raise ValueError("log_interval must be a positive integer")
         self.log_interval = log_interval
         self.recorder = recorder
+        self.upstream_span = None
         self.worker_count = worker_count or len(children_ids)
         self.applied_contributions = 0
         self.update_elapsed = 0.0
@@ -52,7 +54,6 @@ class ParameterServer:
         self.send = send_message if lifecycle is None else lifecycle.send
         self.receive = receive_message if lifecycle is None else lifecycle.receive
         self.log = log
-        self.global_state = {} if global_state is None else global_state
         self._router, self._dealer = router_sock, dealer_sock
         self._stop_sock, self._eval_push = stop_sock, eval_push_sock
         self.flat_params = np.empty(serializer.n_params, dtype=np.float32)
@@ -65,16 +66,18 @@ class ParameterServer:
         self.registered = set()
         self.waiting_for_parent = False
         self.stopped = False
-        self.timer = TimeTree(print_func=log)
 
     def run(self):
         try:
             if self.lifecycle:
                 self.lifecycle.ready()
-            self._init_params()
+            with trace_span(self.recorder, 'initialize_parameters_and_register'):
+                self._init_params()
             if self.lifecycle:
                 self.lifecycle.begin_round()
             self.training_started = time.perf_counter()
+            if self.is_root and self.recorder:
+                self.recorder.clock_origin("training", self.training_started)
             if self.is_root:
                 self.log(f'[TRAIN] ready; waiting for first {"round" if self.synchronous else "update"}')
             self._event_loop()
@@ -118,46 +121,52 @@ class ParameterServer:
         control = self._stop_sock if self.is_root else self._dealer
         if control is not None:
             poller.register(control, zmq.POLLIN)
-        with self.timer.measure('train'):
-            while not self.stopped:
+        while not self.stopped:
+            with trace_span(self.recorder, 'wait_message'):
                 sockets = (self.lifecycle.wait([s for s in (self._router, control) if s is not None])
                            if self.lifecycle else dict(poller.poll()))
-                # Observe termination/parent response before more child traffic.
-                if control in sockets:
+            # Observe termination/parent response before more child traffic.
+            if control in sockets:
+                with trace_span(self.recorder, 'receive_message'):
                     _, kind, payload = self.receive(control)
-                    if kind == bytes([Msg.STOP]):
-                        self._dispatch_stop()
-                        break
-                    if self.is_root or kind != bytes([self.snapshot_message]):
-                        raise ValueError('unexpected control message')
+                if kind == bytes([Msg.STOP]):
+                    self._dispatch_stop()
+                    break
+                if self.is_root or kind != bytes([self.snapshot_message]):
+                    raise ValueError('unexpected control message')
+                with trace_span(self.recorder, 'handle_parent_snapshot'):
                     self._dispatch_parent_push(payload)
-                if not self.stopped and self._router in sockets:
+            if not self.stopped and self._router in sockets:
+                with trace_span(self.recorder, 'receive_message'):
                     identity, kind, payload = self.receive(self._router, routed=True)
-                    child_id = identity.decode('utf-8')
-                    if child_id not in self.registered:
-                        raise ValueError('message from an unregistered child')
-                    if kind == bytes([self.gradient_message]):
+                child_id = identity.decode('utf-8')
+                if child_id not in self.registered:
+                    raise ValueError('message from an unregistered child')
+                if kind == bytes([self.gradient_message]):
+                    with trace_span(self.recorder, 'handle_contribution', peer=child_id, version=self.version):
                         self._accept_contribution(child_id, payload)
-                    elif kind == bytes([self.done_message]):
-                        self._accept_done(child_id, payload)
-                    else:
-                        raise ValueError('unexpected child message')
+                elif kind == bytes([self.done_message]):
+                    self._accept_done(child_id, payload)
+                else:
+                    raise ValueError('unexpected child message')
 
     def _accept_contribution(self, child_id, payload):
         if (self.stopped or child_id not in self.registered or child_id in self.received
                 or self.finished or self.waiting_for_parent):
             raise ValueError('unknown, duplicate or out-of-phase contribution')
-        version, count, gradients = decode_packet(payload, self.flat_params.size, gradients=True)
-        if version != self.version or self.sample_count + count > MAX_VERSION:
-            raise ValueError('wrong round/version or sample-count overflow')
+        with trace_span(self.recorder, 'decode_gradients', peer=child_id):
+            version, count, gradients = decode_packet(payload, self.flat_params.size, gradients=True)
+            if version != self.version or self.sample_count + count > MAX_VERSION:
+                raise ValueError('wrong round/version or sample-count overflow')
         # Validate the prospective sum before committing any round state.
-        with np.errstate(over='ignore', invalid='ignore'):
-            combined = self.gradient_sum + gradients
-        if not np.isfinite(combined).all():
-            raise ValueError('gradient sum overflow')
-        self.gradient_sum[:] = combined
-        self.sample_count += count
-        self.received.add(child_id)
+        with trace_span(self.recorder, 'aggregate_gradients', peer=child_id, version=self.version):
+            with np.errstate(over='ignore', invalid='ignore'):
+                combined = self.gradient_sum + gradients
+            if not np.isfinite(combined).all():
+                raise ValueError('gradient sum overflow')
+            self.gradient_sum[:] = combined
+            self.sample_count += count
+            self.received.add(child_id)
         if len(self.received) == len(self.children_ids):
             if self.is_root:
                 self._commit_root_round()
@@ -167,7 +176,7 @@ class ParameterServer:
     def _commit_root_round(self):
         if self.version == MAX_VERSION:
             raise ValueError('root version overflow')
-        with np.errstate(over='ignore', invalid='ignore'):
+        with trace_span(self.recorder, 'compute_update', version=self.version + 1), np.errstate(over='ignore', invalid='ignore'):
             updated = self.flat_params - self.lr * (self.gradient_sum / self.sample_count)
         if not np.isfinite(updated).all():
             raise ValueError('non-finite root update')
@@ -191,18 +200,23 @@ class ParameterServer:
             self._push_eval()
 
     def _forward_edge_round(self):
-        self.send(self._dealer, Msg.PUSH_GRADS,
-                     encode_packet(self.version, self.gradient_sum, self.sample_count))
+        self._start_upstream_span()
+        with trace_span(self.recorder, 'encode_gradients', version=self.version):
+            payload = encode_packet(self.version, self.gradient_sum, self.sample_count)
+        with trace_span(self.recorder, 'send_gradients', peer=self.parent, version=self.version):
+            self.send(self._dealer, Msg.PUSH_GRADS, payload)
         self.waiting_for_parent = True
         # Retain the completed round until the matching parent response arrives.
 
     def _dispatch_parent_push(self, payload):
-        version, _, params = decode_packet(payload, self.flat_params.size)
-        if self.is_root or not self.waiting_for_parent or self.finished or version != self.version + 1:
-            raise ValueError('unexpected parent snapshot or wrong version')
-        self.flat_params[:] = params
-        self.version = version
+        with trace_span(self.recorder, 'decode_load_parameters', peer=self.parent):
+            version, _, params = decode_packet(payload, self.flat_params.size)
+            if self.is_root or not self.waiting_for_parent or self.finished or version != self.version + 1:
+                raise ValueError('unexpected parent snapshot or wrong version')
+            self.flat_params[:] = params
+            self.version = version
         self.waiting_for_parent = False
+        self._end_upstream_span()
         self._reset_round()
         self._broadcast_snapshot()
 
@@ -214,9 +228,11 @@ class ParameterServer:
     def _broadcast_snapshot(self):
         if self.lifecycle and self.version > 0:
             self.lifecycle.begin_round()
-        payload = encode_packet(self.version, self.flat_params)
+        with trace_span(self.recorder, 'encode_parameters', version=self.version):
+            payload = encode_packet(self.version, self.flat_params)
         for child_id in self.children_ids:
-            self.send(self._router, Msg.PUSH_PARAMS, payload, identity=child_id.encode())
+            with trace_span(self.recorder, 'send_parameters', peer=child_id, version=self.version):
+                self.send(self._router, Msg.PUSH_PARAMS, payload, identity=child_id.encode())
 
     def _accept_done(self, child_id, payload):
         if (self.stopped or child_id not in self.registered or child_id in self.finished
@@ -240,12 +256,16 @@ class ParameterServer:
             self._log_progress()
         self._push_eval()
         if self.lifecycle:
-            self.lifecycle.wait_evaluation(self.version)
+            with trace_span(self.recorder, 'wait_final_evaluation', version=self.version):
+                self.lifecycle.wait_evaluation(self.version)
         self._dispatch_stop()
 
     def _push_eval(self):
         if self._eval_push is not None:
-            self.send(self._eval_push, Msg.EVAL, encode_evaluation(self.version, self.total_samples, self.update_elapsed, self.flat_params))
+            with trace_span(self.recorder, 'encode_evaluation_snapshot', version=self.version):
+                payload = encode_evaluation(self.version, self.total_samples, self.update_elapsed, self.flat_params)
+            with trace_span(self.recorder, 'send_evaluation_snapshot', version=self.version):
+                self.send(self._eval_push, Msg.EVAL, payload)
 
     def _dispatch_stop(self):
         self.stopped = True
@@ -256,7 +276,18 @@ class ParameterServer:
         if self.is_root and self._eval_push is not None:
             self.send(self._eval_push, Msg.STOP)
 
+    def _start_upstream_span(self):
+        self.upstream_span = self.recorder.begin_span() if self.recorder else None
+
+    def _end_upstream_span(self, status='complete'):
+        started, self.upstream_span = self.upstream_span, None
+        if started is not None:
+            self.recorder.end_span(started, 'upstream_exchange', track='upstream',
+                                   status=status, version=self.version, peer=self.parent,
+                                   request=getattr(self, 'upstream_request', None))
+
     def _shutdown(self):
+        self._end_upstream_span(status="interrupted")
         # Existing best-effort transport cleanup; acknowledged shutdown is separate.
         if self.lifecycle is None:
             drain_socket(self._router, seconds=2.0)

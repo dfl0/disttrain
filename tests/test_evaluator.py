@@ -32,12 +32,16 @@ class EvaluatorTests(unittest.TestCase):
             model = torch.nn.Linear(1, 2, bias=False)
             # use synthetic data with real tensors and sockets
             with tempfile.TemporaryDirectory() as directory, patch('training.load_datasets', return_value=(dataset, dataset)):
-                recorder = MetricsRecorder(Path(directory) / 'metrics')
+                recorder = MetricsRecorder(Path(directory) / 'metrics', trace_duration_s=30)
                 run_evaluator(pull, push, model, accuracy_threshold=0, time_limit_s=0,
                               log=print, recorder=recorder)
                 recorder.close()
                 with (recorder.directory / 'evaluations.csv').open() as file:
                     rows = list(csv.DictReader(file))
+                with (recorder.directory / 'spans.csv').open() as file:
+                    operations = {row['operation'] for row in csv.DictReader(file)}
+                self.assertTrue({'receive_decode_snapshots', 'load_parameters', 'evaluation',
+                                 'data_loader_start', 'load_batch', 'evaluate_batch'} <= operations)
                 self.assertEqual(len(rows), 1)
                 self.assertEqual((rows[0]['version'], rows[0]['samples']), ('3', '96'))
                 self.assertAlmostEqual(float(rows[0]['root_elapsed']), 3 * 0.123456789)

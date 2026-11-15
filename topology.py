@@ -179,10 +179,10 @@ def build_topology(raw):
         count = data[key]
         if count is not None and (type(count) is not int or count <= 0):
             raise ValueError(f'data.{key} must be a positive integer or null')
-    metrics = dict(enabled=True, update_every=1, measure_overhead=True)
+    metrics = dict(enabled=True, update_every=1, measure_overhead=True, trace_duration_s=0)
     supplied_metrics = raw.get('metrics', {})
     if not isinstance(supplied_metrics, dict) or supplied_metrics.keys() - metrics.keys():
-        raise ValueError('metrics must contain only enabled, update_every, and/or measure_overhead')
+        raise ValueError('metrics must contain only enabled, update_every, measure_overhead and/or trace_duration_s')
     metrics.update(supplied_metrics)
     if type(metrics['enabled']) is not bool:
         raise ValueError('metrics.enabled must be a boolean')
@@ -190,6 +190,11 @@ def build_topology(raw):
         raise ValueError('metrics.update_every must be a positive integer')
     if type(metrics['measure_overhead']) is not bool:
         raise ValueError('metrics.measure_overhead must be a boolean')
+    duration = metrics['trace_duration_s']
+    if type(duration) not in (int, float) or not math.isfinite(duration) or duration < 0:
+        raise ValueError('metrics.trace_duration_s must be finite and nonnegative')
+    if duration and not metrics['enabled']:
+        raise ValueError('tracing requires metrics.enabled')
     eval_cfg = raw.get('eval', {})
     return dict(metrics=metrics, mode=mode, trace_communication=logging.get('trace_communication', False), workload=workload, node_configs=nodes, root_id=root['id'], eval_id=evaluator['id'],
                 eval_endpoint=evaluator['endpoint'], stop_endpoint=root['stop_endpoint'],

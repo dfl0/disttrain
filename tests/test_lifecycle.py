@@ -244,6 +244,15 @@ class RuntimeLifecycleTests(unittest.TestCase):
                     self.assertEqual(evaluations[-1]['samples'], updates[-1]['samples'])
                     self.assertEqual(evaluations[-1]['version'], updates[-1]['version'])
                     self.assertEqual(evaluations[-1]['root_elapsed'], updates[-1]['elapsed'])
+                    from clock_alignment import ClockAlignment
+                    clocks = ClockAlignment(directory, {n['id']: n for n in raw['nodes']})
+                    self.assertIsNotNone(clocks.zero)
+                    for node in raw['nodes']:
+                        self.assertIn('runtime', clocks.origins[node['id']])
+                        if node['id'] != 'root':
+                            self.assertEqual(set(clocks.anchors[node['id']]), {'startup', 'shutdown'})
+                    self.assertIn('evaluation', clocks.origins['eval'])
+
             finally:
                 for process in processes:
                     if process.is_alive():

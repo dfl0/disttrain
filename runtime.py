@@ -5,19 +5,10 @@ import shutil
 import socket
 import subprocess
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from protocol import Role, ParamSerializer
 from topology import load_topology
-
-
-def new_metrics_state():
-    return {
-        "sections": [],
-        "n_parent_send_reqs": 0,
-        "n_child_send_reqs": 0,
-        "send_reqs_children": [],
-    }
 
 
 @dataclass
@@ -25,7 +16,6 @@ class RuntimeContext:
     hostname: str
     role: Role
     start_time: float
-    metrics: dict = field(default_factory=new_metrics_state)
     node_id: str = None
 
     def log(self, msg, indent=0):
@@ -167,9 +157,12 @@ def main(config_file, *, node_id, metrics_dir=None):
             import uuid
             destination = metrics_dir or str(Path('metrics') / f'{node_id}-{uuid.uuid4().hex[:12]}')
             recorder = MetricsRecorder(destination, update_every=topology['metrics']['update_every'],
-                                       measure_overhead=topology['metrics']['measure_overhead'])
+                                       measure_overhead=topology['metrics']['measure_overhead'],
+                                       trace_duration_s=topology['metrics']['trace_duration_s'])
             log(f'CSV metrics: {destination}')
             lifecycle.health_check = recorder.check
+            lifecycle.clock_recorder = recorder
+            recorder.clock_origin("runtime", context.start_time)
         sockets = open_role_sockets(ctx, role, role_cfg, topology, node_id)
         import torch
         torch.manual_seed(training["seed"])
@@ -225,7 +218,6 @@ def main(config_file, *, node_id, metrics_dir=None):
                     eval_interval=training["eval_interval"],
                     max_rounds=training["max_rounds"],
                     log_interval=training["log_interval"],
-                    global_state=context.metrics,
                     log=log,
                     node_id=node_id,
                     lifecycle=lifecycle,
@@ -249,7 +241,6 @@ def main(config_file, *, node_id, metrics_dir=None):
                     eval_interval=training["eval_interval"],
                     max_rounds=training["max_rounds"],
                     log_interval=training["log_interval"],
-                    global_state=context.metrics,
                     log=log,
                     node_id=node_id,
                     lifecycle=lifecycle,
@@ -259,6 +250,7 @@ def main(config_file, *, node_id, metrics_dir=None):
             case Role.WORKER:
                 n_workers = len(topology["worker_specs"])
                 run_worker(
+                    recorder=recorder,
                     mode=topology['mode'], trace=topology['trace_communication'],
                     dataset_name=dataset_name, sample_limit=topology["data"]["train_samples"],
                     num_workers=training["num_workers"],

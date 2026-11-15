@@ -53,6 +53,7 @@ class Lifecycle:
         self.stop_received = False
         self.error = ''
         self.shutdown_deadline = None
+        self.clock_recorder = None
 
     @staticmethod
     def _milliseconds(deadline):
@@ -86,9 +87,54 @@ class Lifecycle:
         kind, payload = (frame.decode() for frame in frames)
         return peer, kind, payload
 
+    def _clock_reply(self, kind, payload, deadline):
+        if self.is_root or kind != 'CLOCK':
+            return False
+        received = time.monotonic_ns()
+        sent = time.monotonic_ns()
+        self._send('CLOCK_REPLY', json.dumps([int(payload), received, sent]), deadline=deadline)
+        return True
+
+    def _calibrate(self, phase, deadline):
+        """Record the lowest-delay clock sample within the phase deadline."""
+        if self.clock_recorder is None:
+            return
+        budget = min(deadline, time.monotonic() + 1.0)
+        for target in sorted(self.peers):
+            best = None
+            try:
+                for _ in range(5):
+                    first = time.monotonic_ns()
+                    self._send('CLOCK', str(first), peer=target, deadline=budget)
+                    while True:
+                        if not self.socket.poll(self._milliseconds(budget)):
+                            raise TimeoutError('clock calibration expired')
+                        peer, kind, payload = self._receive()
+                        last = time.monotonic_ns()
+                        if kind == 'FAIL':
+                            raise RunStopped(payload)
+                        if kind != 'CLOCK_REPLY':
+                            raise ValueError(f'unexpected calibration message {kind}')
+                        echoed, received, sent = json.loads(payload)
+                        if peer == target and echoed == first:
+                            break  # ignore replies to expired probes
+                    uncertainty = (last - first - (sent - received)) / 2
+                    if sent < received or uncertainty < 0:
+                        continue
+                    sample = ((received + sent) // 2, (first + last) // 2, math.ceil(uncertainty))
+                    if best is None or sample[2] < best[2]:
+                        best = sample
+            except (TimeoutError, zmq.ZMQError):
+                return  # keep any completed samples
+            finally:
+                if best is not None:
+                    self.clock_recorder.record('clock_calibration', target, phase, *best)
+
     def _handle(self):
         peer, kind, payload = self._receive()
         if self.is_root:
+            if kind == 'CLOCK_REPLY':
+                return  # ignore replies to expired probes
             if kind == 'FAIL':
                 self.shutdown_deadline = time.monotonic() + self.timeouts['shutdown_s']
                 raise RunStopped(payload)
@@ -120,18 +166,23 @@ class Lifecycle:
                 if kind != 'READY' or payload or peer in ready:
                     raise ValueError('expected unique READY from each participant')
                 ready.add(peer)
+            self._calibrate('startup', self.deadline)
             for peer in self.peers:
                 self._send('START', peer=peer, deadline=self.deadline)
         else:
             self._send('READY', deadline=self.deadline)
-            if not self.socket.poll(self._milliseconds(self.deadline)):
-                raise TimeoutError('startup: root did not release participants')
-            _, kind, payload = self._receive()
-            if kind == 'STOP':
-                self.stop_received, self.error = True, payload
-                raise RunStopped(payload)
-            if kind != 'START' or payload:
-                raise ValueError('expected START from root')
+            while True:
+                if not self.socket.poll(self._milliseconds(self.deadline)):
+                    raise TimeoutError('startup: root did not release participants')
+                _, kind, payload = self._receive()
+                if self._clock_reply(kind, payload, self.deadline):
+                    continue
+                if kind == 'STOP':
+                    self.stop_received, self.error = True, payload
+                    raise RunStopped(payload)
+                if kind != 'START' or payload:
+                    raise ValueError('expected START from root')
+                break
 
     def begin_round(self):
         seconds = self.timeouts['training_s']
@@ -216,13 +267,18 @@ class Lifecycle:
                 _, kind, payload = self._receive()
                 if kind == 'STOP':
                     self.stop_received, self.error = True, payload
+                elif self._clock_reply(kind, payload, deadline):
+                    continue
                 elif kind != 'START':
                     raise ValueError('shutdown: expected STOP')
             error = merge_reports(error, self.error)
             self._send('ACK', json.dumps(dict(error=error, work=self.work_report)), deadline=deadline)
-            if not self.socket.poll(self._milliseconds(deadline)):
-                raise TimeoutError('shutdown: root did not confirm acknowledgement')
-            _, kind, payload = self._receive()
+            while True:
+                if not self.socket.poll(self._milliseconds(deadline)):
+                    raise TimeoutError('shutdown: root did not confirm acknowledgement')
+                _, kind, payload = self._receive()
+                if not self._clock_reply(kind, payload, deadline):
+                    break
             if kind == 'INCOMPLETE':
                 raise TimeoutError(payload)
             if kind != 'FINISH':
@@ -261,15 +317,22 @@ class Lifecycle:
                         if peer not in notified:
                             self._send('STOP', error, peer=peer, deadline=deadline)
                             notified.add(peer)
-                    elif kind not in ('EVALUATED', 'STOP_REQUEST'):
+                    elif kind not in ('EVALUATED', 'STOP_REQUEST', 'CLOCK_REPLY'):
                         raise ValueError('unexpected shutdown control message')
             except TimeoutError:
                 shutdown_error = f'missing acknowledgements from {sorted(self.peers - acknowledged)}'
+            if not shutdown_error and not error:
+                self._calibrate('shutdown', deadline)
             # Nonblocking final confirmations; bounded linger below permits flush.
             for peer in acknowledged:
-                self.socket.send_multipart([peer.encode(),
-                                            b'INCOMPLETE' if shutdown_error else b'FINISH',
-                                            (shutdown_error or error).encode()], flags=zmq.DONTWAIT)
+                try:
+                    self.socket.send_multipart([peer.encode(),
+                                                b'INCOMPLETE' if shutdown_error else b'FINISH',
+                                                (shutdown_error or error).encode()], flags=zmq.DONTWAIT)
+                except zmq.ZMQError:
+                    # preserve the missing-ACK error if a peer has disconnected
+                    if not shutdown_error:
+                        raise
         # A received FINISH proves participant ACK delivery. Root gets a bounded
         # flush budget for FINISH, not the old unconditional two-second drain.
         self.socket.close(linger=max(0, math.ceil((deadline - time.monotonic()) * 1000)))

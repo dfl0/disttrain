@@ -2,6 +2,7 @@
 import time
 import numpy as np
 from ps import ParameterServer
+from metrics import trace_span
 from protocol import (Msg, MAX_VERSION, encode_async_gradients, decode_async_gradients,
                       encode_async_params, decode_async_params, decode_version, encode_version)
 
@@ -46,9 +47,11 @@ class AsyncParameterServer(ParameterServer):
 
     def _broadcast_snapshot(self):
         # broadcast only the initial snapshot
-        payload = encode_async_params(0, self.version, self.flat_params)
+        with trace_span(self.recorder, 'encode_parameters', version=self.version, request=0):
+            payload = encode_async_params(0, self.version, self.flat_params)
         for child in self.children_ids:
-            self.send(self._router, self.snapshot_message, payload, identity=child.encode())
+            with trace_span(self.recorder, 'send_parameters', peer=child, version=self.version, request=0):
+                self.send(self._router, self.snapshot_message, payload, identity=child.encode())
 
     def _event_loop(self):
         if self.lifecycle and not self.is_root:
@@ -58,22 +61,24 @@ class AsyncParameterServer(ParameterServer):
     def _accept_contribution(self, child, payload):
         if self.stopped or child not in self.registered or child in self.finished or child in self.received:
             raise ValueError('unknown, completed or busy async child')
-        request, records, gradients = decode_async_gradients(payload, self.flat_params.size)
-        if request != self.requests[child] + 1:
-            raise ValueError('duplicate or out-of-order async request')
-        if self.child_ranks[child] >= 0 and (len(records) != 1 or records[0][1] != request):
-            raise ValueError('worker must send exactly its own sequential contribution')
-        for rank, contribution, source, samples in records:
-            if (rank not in self.worker_groups[child] or contribution != self.contributions[rank] + 1
-                    or source != self.sources[rank] or source > self.version):
-                raise ValueError('invalid async membership, contribution ID or source version')
+        with trace_span(self.recorder, 'decode_gradients', peer=child):
+            request, records, gradients = decode_async_gradients(payload, self.flat_params.size)
+            if request != self.requests[child] + 1:
+                raise ValueError('duplicate or out-of-order async request')
+            if self.child_ranks[child] >= 0 and (len(records) != 1 or records[0][1] != request):
+                raise ValueError('worker must send exactly its own sequential contribution')
+            for rank, contribution, source, samples in records:
+                if (rank not in self.worker_groups[child] or contribution != self.contributions[rank] + 1
+                        or source != self.sources[rank] or source > self.version):
+                    raise ValueError('invalid async membership, contribution ID or source version')
         count = sum(r[3] for r in records)
         if self.sample_count + count > MAX_VERSION:
             raise ValueError('pending sample count overflow')
-        with np.errstate(over='ignore', invalid='ignore'):
-            combined = self.gradient_sum + gradients
-        if not np.isfinite(combined).all():
-            raise ValueError('pending gradient sum overflow')
+        with trace_span(self.recorder, 'aggregate_gradients', peer=child, version=self.version):
+            with np.errstate(over='ignore', invalid='ignore'):
+                combined = self.gradient_sum + gradients
+            if not np.isfinite(combined).all():
+                raise ValueError('pending gradient sum overflow')
         # keep the child busy until its contribution is applied
         self.requests[child] = request
         for rank, contribution, source, samples in records:
@@ -96,7 +101,7 @@ class AsyncParameterServer(ParameterServer):
     def _apply_pending(self):
         if self.version == MAX_VERSION:
             raise ValueError('root version overflow')
-        with np.errstate(over='ignore', invalid='ignore'):
+        with trace_span(self.recorder, 'compute_update', version=self.version + 1), np.errstate(over='ignore', invalid='ignore'):
             updated = self.flat_params - self.lr * (self.gradient_sum / self.reference_samples)
         if not np.isfinite(updated).all():
             raise ValueError('non-finite root update')
@@ -131,18 +136,23 @@ class AsyncParameterServer(ParameterServer):
             self._push_eval()
 
     def _reply(self, child, request):
-        payload = encode_async_params(request, self.version, self.flat_params)
-        self.send(self._router, self.snapshot_message, payload, identity=child.encode())
+        with trace_span(self.recorder, 'encode_parameters', version=self.version, request=request):
+            payload = encode_async_params(request, self.version, self.flat_params)
+        with trace_span(self.recorder, 'send_parameters', peer=child, version=self.version, request=request):
+            self.send(self._router, self.snapshot_message, payload, identity=child.encode())
         self._trace('reply', child=child, request=request, version=self.version)
 
     def _forward_pending(self):
         if not self.pending or self.inflight:
             return
         request = self.upstream_request + 1
-        payload = encode_async_gradients(request, self.pending, self.gradient_sum)
+        self._start_upstream_span()
+        with trace_span(self.recorder, 'encode_gradients', request=request):
+            payload = encode_async_gradients(request, self.pending, self.gradient_sum)
         if self.lifecycle:
             self.lifecycle.begin_round()  # child traffic must not reset this deadline
-        self.send(self._dealer, self.gradient_message, payload)
+        with trace_span(self.recorder, 'send_gradients', peer=self.parent, request=request):
+            self.send(self._dealer, self.gradient_message, payload)
         self.upstream_request = request
         self.inflight, self.pending = self.pending, []
         self.gradient_sum.fill(0)
@@ -150,11 +160,13 @@ class AsyncParameterServer(ParameterServer):
         self._trace('forward', request=request, records=self.inflight)
 
     def _dispatch_parent_push(self, payload):
-        request, version, params = decode_async_params(payload, self.flat_params.size)
-        if not self.inflight or request != self.upstream_request or version <= self.version:
-            raise ValueError('unmatched or non-monotonic async reply')
-        self.flat_params[:] = params
-        self.version = version
+        with trace_span(self.recorder, 'decode_load_parameters', peer=self.parent):
+            request, version, params = decode_async_params(payload, self.flat_params.size)
+            if not self.inflight or request != self.upstream_request or version <= self.version:
+                raise ValueError('unmatched or non-monotonic async reply')
+            self.flat_params[:] = params
+            self.version = version
+        self._end_upstream_span()
         if self.lifecycle:
             self.lifecycle.deadline = None
         by_rank = {rank: child for child, rank in self.child_ranks.items()}

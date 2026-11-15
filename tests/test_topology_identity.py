@@ -23,13 +23,18 @@ def flat():
 class TopologyIdentityTests(unittest.TestCase):
     def test_metric_recording_controls(self):
         self.assertEqual(build_topology(flat())['metrics'],
-                         dict(enabled=True, update_every=1, measure_overhead=True))
-        configured = dict(enabled=True, update_every=7, measure_overhead=False)
+                         dict(enabled=True, update_every=1, measure_overhead=True, trace_duration_s=0))
+        configured = dict(enabled=True, update_every=7, measure_overhead=False, trace_duration_s=5)
         self.assertEqual(build_topology({**flat(), 'metrics': configured})['metrics'], configured)
         for invalid in (0, -1, True, 1.5):
             with self.assertRaises(ValueError):
                 build_topology({**flat(), 'metrics': dict(update_every=invalid)})
 
+        for invalid in (-1, True, float('nan'), float('inf'), '5'):
+            with self.assertRaises(ValueError):
+                build_topology({**flat(), 'metrics': dict(trace_duration_s=invalid)})
+        with self.assertRaises(ValueError):
+            build_topology({**flat(), 'metrics': dict(enabled=False, trace_duration_s=5)})
 
     def test_async_mode_and_trace_configuration(self):
         raw = flat()

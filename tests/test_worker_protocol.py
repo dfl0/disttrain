@@ -1,4 +1,7 @@
 """Test worker gradients and messages using local sockets."""
+import csv
+from pathlib import Path
+import tempfile
 import multiprocessing
 import unittest
 
@@ -10,8 +13,10 @@ from protocol import encode_async_params, decode_async_gradients
 from protocol import Msg, encode_assignment, decode_packet, encode_packet, decode_version
 
 
-def worker_process(endpoint, samples, local_steps, batch_size, asynchronous=False):
+def worker_process(endpoint, samples, local_steps, batch_size, asynchronous=False, metrics_dir=None):
     import training
+    from metrics import MetricsRecorder
+    recorder = MetricsRecorder(metrics_dir, trace_duration_s=30) if metrics_dir else None
     dataset = torch.utils.data.TensorDataset(torch.ones(samples, 1), torch.zeros(samples, dtype=torch.long))
     # use synthetic data with the real loader
     training.load_datasets = lambda **kwargs: (dataset, dataset)
@@ -22,23 +27,35 @@ def worker_process(endpoint, samples, local_steps, batch_size, asynchronous=Fals
     try:
         training.run_worker(dealer, torch.nn.Linear(1, 2, bias=False), n_workers=1,
                             batch_size=batch_size, local_steps=local_steps, worker_rank=0,
-                            log=print, node_id='worker', mode='async' if asynchronous else 'sync')
+                            log=print, node_id='worker', recorder=recorder, mode='async' if asynchronous else 'sync')
     finally:
         dealer.close(0)
         context.term()
+        if recorder:
+            recorder.close()
 
 
 class WorkerProtocolTests(unittest.TestCase):
     def test_async_partial_windows_and_version_jumps(self):
-        self.check_windows(local_steps=2, samples=5, expected=[4, 1], batch_size=2, asynchronous=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            metrics_dir = str(Path(tmp) / 'worker')
+            self.check_windows(local_steps=2, samples=5, expected=[4, 1], batch_size=2,
+                               asynchronous=True, metrics_dir=metrics_dir)
+            with (Path(metrics_dir) / 'spans.csv').open() as file:
+                rows = list(csv.DictReader(file))
+            operations = [row['operation'] for row in rows]
+            self.assertTrue({'register', 'load_batch', 'decode_load_parameters', 'forward_backward',
+                             'encode_gradients', 'send_gradients', 'wait_snapshot', 'wait_stop'} <= set(operations))
+            self.assertEqual(operations.count('forward_backward'), 3)
+            self.assertEqual(operations.count('send_gradients'), 2)
 
-    def check_windows(self, local_steps, samples, expected, batch_size=1, asynchronous=False):
+    def check_windows(self, local_steps, samples, expected, batch_size=1, asynchronous=False, metrics_dir=None):
         context = zmq.Context()
         router = context.socket(zmq.ROUTER)
         router.setsockopt(zmq.RCVTIMEO, 20000)
         port = router.bind_to_random_port('tcp://127.0.0.1')
         process = multiprocessing.get_context('spawn').Process(
-            target=worker_process, args=(f'tcp://127.0.0.1:{port}', samples, local_steps, batch_size, asynchronous))
+            target=worker_process, args=(f'tcp://127.0.0.1:{port}', samples, local_steps, batch_size, asynchronous, metrics_dir))
         process.start()
         try:
             self.assertEqual(router.recv_multipart(), [b'worker', bytes([Msg.REGISTER]), b'worker'])
