@@ -1,4 +1,4 @@
-"""Real worker/autograd and loopback ZeroMQ regression checks; no dataset downloads."""
+"""Test worker gradients and messages using local sockets."""
 import multiprocessing
 import unittest
 
@@ -6,13 +6,14 @@ import numpy as np
 import torch
 import zmq
 
+from protocol import encode_async_params, decode_async_gradients
 from protocol import Msg, encode_assignment, decode_packet, encode_packet, decode_version
 
 
-def worker_process(endpoint, samples, local_steps, batch_size):
+def worker_process(endpoint, samples, local_steps, batch_size, asynchronous=False):
     import training
     dataset = torch.utils.data.TensorDataset(torch.ones(samples, 1), torch.zeros(samples, dtype=torch.long))
-    # Supply real synthetic data at the dataset boundary, not a simulated loader.
+    # use synthetic data with the real loader
     training.load_datasets = lambda **kwargs: (dataset, dataset)
     context = zmq.Context()
     dealer = context.socket(zmq.DEALER)
@@ -21,40 +22,51 @@ def worker_process(endpoint, samples, local_steps, batch_size):
     try:
         training.run_worker(dealer, torch.nn.Linear(1, 2, bias=False), n_workers=1,
                             batch_size=batch_size, local_steps=local_steps, worker_rank=0,
-                            log=print, node_id='worker')
+                            log=print, node_id='worker', mode='async' if asynchronous else 'sync')
     finally:
         dealer.close(0)
         context.term()
 
 
 class WorkerProtocolTests(unittest.TestCase):
-    def check_windows(self, local_steps, samples, expected, batch_size=1):
+    def test_async_partial_windows_and_version_jumps(self):
+        self.check_windows(local_steps=2, samples=5, expected=[4, 1], batch_size=2, asynchronous=True)
+
+    def check_windows(self, local_steps, samples, expected, batch_size=1, asynchronous=False):
         context = zmq.Context()
         router = context.socket(zmq.ROUTER)
         router.setsockopt(zmq.RCVTIMEO, 20000)
         port = router.bind_to_random_port('tcp://127.0.0.1')
         process = multiprocessing.get_context('spawn').Process(
-            target=worker_process, args=(f'tcp://127.0.0.1:{port}', samples, local_steps, batch_size))
+            target=worker_process, args=(f'tcp://127.0.0.1:{port}', samples, local_steps, batch_size, asynchronous))
         process.start()
         try:
             self.assertEqual(router.recv_multipart(), [b'worker', bytes([Msg.REGISTER]), b'worker'])
             router.send_multipart([b'worker', bytes([Msg.ASSIGN]), encode_assignment(0)])
             for version, count in enumerate(expected):
-                # Only one snapshot per window. A duplicate initial receive times out.
-                router.send_multipart([b'worker', bytes([Msg.PUSH_PARAMS]),
-                                       encode_packet(version, np.zeros(2, dtype=np.float32))])
+                # send one snapshot per window
+                router.send_multipart([b'worker', bytes([Msg.ASYNC_PARAMS if asynchronous else Msg.PUSH_PARAMS]),
+                                       encode_async_params(version, version * 3, np.zeros(2, dtype=np.float32)) if asynchronous
+                                       else encode_packet(version, np.zeros(2, dtype=np.float32))])
                 identity, kind, payload = router.recv_multipart()
-                self.assertEqual((identity, kind), (b'worker', bytes([Msg.PUSH_GRADS])))
-                actual_version, count_received, gradient = decode_packet(payload, 2, gradients=True)
+                self.assertEqual((identity, kind), (b'worker', bytes([Msg.ASYNC_GRADS if asynchronous else Msg.PUSH_GRADS])))
+                if asynchronous:
+                    request, records, gradient = decode_async_gradients(payload, 2)
+                    self.assertEqual(request, version + 1)
+                    self.assertEqual(records, [(0, version + 1, version * 3, count)])
+                    actual_version, count_received = version, records[0][3]
+                else:
+                    actual_version, count_received, gradient = decode_packet(payload, 2, gradients=True)
                 self.assertEqual(count_received, count)
                 self.assertEqual(actual_version, version)
-                # Cross-entropy at zero logits for class 0: [-0.5, 0.5] per sample.
+                # expected gradient is [-0.5, 0.5] per sample
                 np.testing.assert_allclose(gradient, np.array([-0.5, 0.5]) * count)
             if expected:
-                router.send_multipart([b'worker', bytes([Msg.PUSH_PARAMS]),
-                                       encode_packet(len(expected), np.zeros(2, dtype=np.float32))])
+                router.send_multipart([b'worker', bytes([Msg.ASYNC_PARAMS if asynchronous else Msg.PUSH_PARAMS]),
+                                       encode_async_params(len(expected), len(expected) * 3, np.zeros(2, dtype=np.float32)) if asynchronous
+                                       else encode_packet(len(expected), np.zeros(2, dtype=np.float32))])
                 identity, kind, payload = router.recv_multipart()
-                self.assertEqual((identity, kind), (b'worker', bytes([Msg.DONE])))
+                self.assertEqual((identity, kind), (b'worker', bytes([Msg.ASYNC_DONE if asynchronous else Msg.DONE])))
                 self.assertEqual(decode_version(payload), len(expected))
             router.send_multipart([b'worker', bytes([Msg.STOP]), b''])
             process.join(20)

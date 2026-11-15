@@ -119,7 +119,7 @@ class LifecycleTests(unittest.TestCase):
         self.exchange(missing_ack=True, interrupt_root=True)
 
 
-def run_small_runtime(config_path, node_id, results, interrupt_worker=False, small_workload=False):
+def run_small_runtime(config_path, node_id, results, interrupt_worker=False, small_workload=False, asynchronous=False, flat=False, capped=True):
     """Real runtime/ResNet/autograd; only the CIFAR data source is synthetic."""
     import torch
     import training
@@ -154,14 +154,20 @@ def run_small_runtime(config_path, node_id, results, interrupt_worker=False, sma
     else:
         assert status is None, (status, text)
         if node_id == 'root':
-            assert '[TRAIN] round=1 samples=' in text, text
+            assert ('[TRAIN] update=1 applied_samples=' if asynchronous else '[TRAIN] round=1 samples=') in text, text
+            if asynchronous:
+                assert 'discarded_contributions=' in text, text
+                assert ('applied_contributions=1 applied_samples=2' if capped
+                        else 'applied_contributions=4 applied_samples=6') in text, text
+                if not capped:
+                    assert 'discarded_contributions=0 discarded_samples=0 partial_discarded_samples=0' in text, text
         results.put((node_id, 'ok'))
     if status:
         raise SystemExit(status)
 
 
 class RuntimeLifecycleTests(unittest.TestCase):
-    def run_hierarchy(self, interrupt_worker=False, small_workload=False, metrics_enabled=True):
+    def run_hierarchy(self, interrupt_worker=False, small_workload=False, asynchronous=False, flat=False, capped=True, metrics_enabled=True):
         import json
         import multiprocessing
         import socket
@@ -180,7 +186,7 @@ class RuntimeLifecycleTests(unittest.TestCase):
         raw = dict(monitoring=dict(enabled=False), metrics=dict(enabled=metrics_enabled),
                    data=dict(root="./test-data", download=True),
                    timeouts=dict(startup_s=30, shutdown_s=10),
-                   training=dict(batch_size=2, n_epochs=1, eval_interval=200),
+                   training=dict(batch_size=2, n_epochs=1, eval_interval=200, log_interval=1000),
                    eval=dict(accuracy_threshold=2, time_limit_s=60),
                    nodes=[
                        dict(id='root', role='root_ps', host='127.0.0.1', endpoint=root, stop_endpoint=control),
@@ -191,13 +197,22 @@ class RuntimeLifecycleTests(unittest.TestCase):
             raw['workload'] = 'lenet_mnist'
             raw['training'].update(max_rounds=1, cpu_threads=1, num_workers=0)
             raw['data'].update(train_samples=6, eval_samples=3)
+        if asynchronous:
+            raw['mode'] = 'async'
+            raw['training']['max_rounds'] = 1 if capped else None
+            raw['nodes'].append(dict(id='worker2', role='worker', host='127.0.0.1', parent='edge'))
+            if flat:
+                raw['nodes'] = [node for node in raw['nodes'] if node['id'] != 'edge']
+                for node in raw['nodes']:
+                    if node['role'] == 'worker':
+                        node['parent'] = 'root'
         spawn = multiprocessing.get_context('spawn')
         results = spawn.Queue()
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'config.yaml'
             path.write_text(json.dumps(raw))
-            processes = [spawn.Process(target=run_small_runtime, args=(str(path), name, results, interrupt_worker, small_workload))
-                         for name in ('root', 'edge', 'worker', 'eval')]
+            processes = [spawn.Process(target=run_small_runtime, args=(str(path), node['id'], results, interrupt_worker, small_workload, asynchronous, flat, capped))
+                         for node in raw['nodes']]
             try:
                 for process in processes:
                     process.start()
@@ -210,9 +225,9 @@ class RuntimeLifecycleTests(unittest.TestCase):
                     records = dict(results.get(timeout=2) for _ in processes)
                     self.assertTrue(all(value == 'interrupted: clean shutdown' for value in records.values()), records)
                 else:
-                    self.assertEqual(codes, [0] * 4)
+                    self.assertEqual(codes, [0] * len(processes))
                     self.assertEqual(dict(results.get(timeout=2) for _ in processes),
-                                     dict(root='ok', edge='ok', worker='ok', eval='ok'))
+                                     {node['id']: 'ok' for node in raw['nodes']})
                     final = json.loads((Path(directory) / 'root.metrics' / 'result.json').read_text())
                     self.assertGreater(final['elapsed'], 0)
                     if not metrics_enabled:
@@ -246,6 +261,11 @@ class RuntimeLifecycleTests(unittest.TestCase):
 
     def test_mnist_round_limit_and_final_evaluation(self):
         self.run_hierarchy(small_workload=True)
+
+    def test_async_flat_and_hierarchy_completion_and_cap(self):
+        for flat, capped in ((True, False), (False, False), (False, True)):
+            with self.subTest(flat=flat, capped=capped):
+                self.run_hierarchy(small_workload=True, asynchronous=True, flat=flat, capped=capped)
 
     def test_metrics_disabled_keeps_exact_final_result(self):
         self.run_hierarchy(small_workload=True, metrics_enabled=False)

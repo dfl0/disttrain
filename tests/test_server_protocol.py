@@ -13,7 +13,7 @@ from transport import open_control_socket, send_message, receive_message, open_r
 
 
 @contextmanager
-def server(children=('w0', 'w1'), ranks=None, edge=False):
+def server(children=('w0', 'w1'), ranks=None, edge=False, asynchronous=False, groups=None):
     context = zmq.Context()
     router = context.socket(zmq.ROUTER)
     router.setsockopt(zmq.RCVTIMEO, 2000)
@@ -36,10 +36,20 @@ def server(children=('w0', 'w1'), ranks=None, edge=False):
             dealer.setsockopt(zmq.RCVTIMEO, 2000)
             dealer.connect('inproc://parent')
             send_message(parent_peer, Msg.ASSIGN, encode_assignment(-1))
-            send_message(parent_peer, Msg.PUSH_PARAMS, encode_packet(0, np.zeros(1, dtype=np.float32)))
+            if asynchronous:
+                from protocol import encode_async_params
+                send_message(parent_peer, Msg.ASYNC_PARAMS, encode_async_params(0, 0, np.zeros(1, dtype=np.float32)))
+            else:
+                send_message(parent_peer, Msg.PUSH_PARAMS, encode_packet(0, np.zeros(1, dtype=np.float32)))
         model = torch.nn.Linear(1, 1, bias=False)
         torch.nn.init.zeros_(model.weight)
-        ps = ParameterServer(model, children, True, router, ParamSerializer(model), lambda module: None,
+        server_type, options = ParameterServer, {}
+        if asynchronous:
+            from async_ps import AsyncParameterServer
+            server_type = AsyncParameterServer
+            options = dict(reference_samples=8, worker_groups=groups or {name: {i} for i, name in enumerate(children)})
+        ps = server_type(model, children, not asynchronous, router, ParamSerializer(model), lambda module: None,
+                             **options,
                              child_ranks=ranks or {name: i for i, name in enumerate(children)},
                              parent='root' if edge else None, dealer_sock=dealer,
                              node_id='edge' if edge else 'root', lr=0.1)

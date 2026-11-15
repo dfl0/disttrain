@@ -39,6 +39,13 @@ def build_topology(raw):
                          'with explicit id, role, host, parent and endpoint fields')
     if not isinstance(raw['nodes'], list):
         raise ValueError('nodes must be a list')
+    mode = raw.get('mode', 'sync')
+    if mode not in ('sync', 'async'):
+        raise ValueError('mode must be sync or async')
+    logging = raw.get('logging', {})
+    if (not isinstance(logging, dict) or logging.keys() - {'trace_communication'}
+            or type(logging.get('trace_communication', False)) is not bool):
+        raise ValueError('logging.trace_communication must be a boolean')
     nodes = {}
     advertised = set()
     listeners = set()
@@ -59,10 +66,10 @@ def build_topology(raw):
             raise ValueError(f'{node_id}: CPU/bandwidth throttling is temporarily unsupported; '
                              'remove cpu/bw limits for an unthrottled run')
         cfg['children'] = []
+        if 'sync' in cfg or 'mode' in cfg:
+            raise ValueError(f'{node_id}: use top-level mode to select sync or async training')
         if role in ('root_ps', 'edge_ps'):
-            cfg.setdefault('sync', True)
-            if cfg['sync'] is not True:
-                raise ValueError(f'{node_id}: only synchronous root-only optimization is supported')
+            cfg['sync'] = mode == 'sync'
         if role != 'worker':
             if 'endpoint' not in cfg:
                 raise ValueError(f'{node_id}: endpoint required')
@@ -184,7 +191,7 @@ def build_topology(raw):
     if type(metrics['measure_overhead']) is not bool:
         raise ValueError('metrics.measure_overhead must be a boolean')
     eval_cfg = raw.get('eval', {})
-    return dict(metrics=metrics, workload=workload, node_configs=nodes, root_id=root['id'], eval_id=evaluator['id'],
+    return dict(metrics=metrics, mode=mode, trace_communication=logging.get('trace_communication', False), workload=workload, node_configs=nodes, root_id=root['id'], eval_id=evaluator['id'],
                 eval_endpoint=evaluator['endpoint'], stop_endpoint=root['stop_endpoint'],
                 worker_specs=workers, worker_ranks=worker_ranks, training=training, data=data, monitoring=monitoring, timeouts=timeouts,
                 eval_accuracy_threshold=eval_cfg.get('accuracy_threshold', 0.90),

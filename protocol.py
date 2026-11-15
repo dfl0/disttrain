@@ -1,4 +1,4 @@
-"""Synchronous wire format and parameter-only tensor serialization.
+"""Sync/async wire formats and parameter-only tensor serialization.
 
 DTR1 packets carry unsigned 64-bit version, sample count and tensor length in
 network byte order, followed by little-endian float32 values. One root update
@@ -24,6 +24,9 @@ class Msg(IntEnum):
     REGISTER = 5
     ASSIGN = 6
     DONE = 7
+    ASYNC_GRADS = 8
+    ASYNC_PARAMS = 9
+    ASYNC_DONE = 10
 
 
 _HEADER = struct.Struct('!4sQQQ')
@@ -36,11 +39,16 @@ def encode_packet(version, values, sample_count=0):
     if (type(version) is not int or not 0 <= version <= MAX_VERSION
             or type(sample_count) is not int or not 0 <= sample_count <= MAX_VERSION):
         raise ValueError('version and sample count must be uint64 integers')
+    tensor = _tensor_bytes(values)
+    return _HEADER.pack(b'DTR1', version, sample_count, values.size) + tensor
+
+
+def _tensor_bytes(values):
     if (not isinstance(values, np.ndarray) or values.ndim != 1
             or values.dtype != np.dtype(np.float32) or not values.flags.c_contiguous
             or not np.isfinite(values).all()):
         raise ValueError('packet values must be finite contiguous float32 vector')
-    return _HEADER.pack(b'DTR1', version, sample_count, values.size) + values.astype('<f4', copy=False).tobytes()
+    return values.astype('<f4', copy=False).tobytes()
 
 
 def decode_packet(payload, n_params, *, gradients=False):
@@ -82,6 +90,63 @@ def decode_version(payload):
     if len(payload) != _VERSION.size:
         raise ValueError('invalid completion version')
     return _VERSION.unpack(payload)[0]
+
+
+# preserve each worker contribution when summing gradients
+_ASYNC_HEADER = struct.Struct('!4sQQQ')
+_RECORD = struct.Struct('!QQQQ')  # rank, contribution id, source version, samples
+
+
+def _validate_records(records):
+    ranks = set()
+    count = 0
+    if not records:
+        raise ValueError('async aggregate requires contribution records')
+    for record in records:
+        if len(record) != 4 or any(type(v) is not int or not 0 <= v <= MAX_VERSION for v in record):
+            raise ValueError('invalid async contribution record')
+        rank, contribution, version, samples = record
+        if rank in ranks or contribution == 0 or samples == 0:
+            raise ValueError('duplicate rank or zero contribution/sample count')
+        ranks.add(rank)
+        count += samples
+    if count > MAX_VERSION:
+        raise ValueError('async sample-count overflow')
+
+
+def encode_async_gradients(request_id, records, values):
+    encode_version(request_id)
+    if request_id == 0:
+        raise ValueError('async request IDs start at one')
+    _validate_records(records)
+    tensor = _tensor_bytes(values)
+    return (_ASYNC_HEADER.pack(b'DTA1', request_id, len(records), values.size)
+            + b''.join(_RECORD.pack(*record) for record in records) + tensor)
+
+
+def decode_async_gradients(payload, n_params):
+    if len(payload) < _ASYNC_HEADER.size:
+        raise ValueError('truncated async header')
+    magic, request_id, count, length = _ASYNC_HEADER.unpack_from(payload)
+    offset = _ASYNC_HEADER.size + count * _RECORD.size
+    if magic != b'DTA1' or request_id == 0 or length != n_params or len(payload) != offset + length * 4:
+        raise ValueError('invalid async gradient packet')
+    records = [_RECORD.unpack_from(payload, _ASYNC_HEADER.size + i * _RECORD.size) for i in range(count)]
+    _validate_records(records)
+    values = np.frombuffer(payload, dtype='<f4', offset=offset).astype(np.float32, copy=False)
+    if not np.isfinite(values).all():
+        raise ValueError('non-finite async gradients')
+    return request_id, records, values
+
+
+def encode_async_params(request_id, version, values):
+    return encode_version(request_id) + encode_packet(version, values)
+
+
+def decode_async_params(payload, n_params):
+    request_id = decode_version(payload[:_VERSION.size])
+    version, _, values = decode_packet(payload[_VERSION.size:], n_params)
+    return request_id, version, values
 
 
 _EVAL_METADATA = struct.Struct('!Qd')

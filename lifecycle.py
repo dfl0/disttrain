@@ -47,6 +47,8 @@ class Lifecycle:
         self.evaluator_id = evaluator_id
         self.timeouts = timeouts
         self.deadline = time.monotonic() + timeouts['startup_s']
+        self.work_report = None
+        self.work_reports = {}
         self.last_evaluated = -1
         self.stop_received = False
         self.error = ''
@@ -217,7 +219,7 @@ class Lifecycle:
                 elif kind != 'START':
                     raise ValueError('shutdown: expected STOP')
             error = merge_reports(error, self.error)
-            self._send('ACK', error, deadline=deadline)
+            self._send('ACK', json.dumps(dict(error=error, work=self.work_report)), deadline=deadline)
             if not self.socket.poll(self._milliseconds(deadline)):
                 raise TimeoutError('shutdown: root did not confirm acknowledgement')
             _, kind, payload = self._receive()
@@ -245,8 +247,14 @@ class Lifecycle:
                     peer, kind, payload = self._receive()
                     if kind == 'ACK':
                         acknowledged.add(peer)
-                        if payload:
-                            error = merge_reports(error, payload)
+                        ack = json.loads(payload)
+                        error = merge_reports(error, ack['error'])
+                        work = ack['work']
+                        if work is not None and (not isinstance(work, dict)
+                                or set(work) != {'contributions', 'samples', 'partial_samples'}
+                                or any(type(value) is not int or value < 0 for value in work.values())):
+                            raise ValueError('invalid shutdown work report')
+                        self.work_reports[peer] = work
                     elif kind in ('READY', 'FAIL'):
                         if kind == 'FAIL':
                             error = merge_reports(error, payload)

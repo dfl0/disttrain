@@ -126,7 +126,7 @@ def collect_sys_metrics(stop_event, context, log, interval, interface=None, reco
 
 
 
-def main(config_file='config.yaml', *, node_id, metrics_dir=None):
+def main(config_file, *, node_id, metrics_dir=None):
     topology = load_topology(config_file)
     role_cfg = determine_role(node_id, topology)
     role = role_cfg["role"]
@@ -195,10 +195,21 @@ def main(config_file='config.yaml', *, node_id, metrics_dir=None):
             monitor_thread = threading.Thread(target=monitor,
                 name=f'disttrain-metrics-{node_id}', daemon=True)
             monitor_thread.start()
+        server_type = ParameterServer
+        server_options = {}
+        if topology['mode'] == 'async':
+            from async_ps import AsyncParameterServer
+            server_type = AsyncParameterServer
+            groups = {child: ({topology['worker_ranks'][child]} if child in topology['worker_ranks']
+                              else {topology['worker_ranks'][worker] for worker in topology['node_configs'][child]['children']})
+                      for child in role_cfg.get('children', [])}
+            server_options = dict(worker_groups=groups, reference_samples=(len(topology['worker_specs'])
+                                  * training['batch_size'] * training['local_steps']),
+                                  trace=topology['trace_communication'])
         match role:
             case Role.ROOT_PS:
-                server = ParameterServer(
-                    recorder=recorder, worker_count=len(topology['worker_specs']),
+                server = server_type(
+                    **server_options, recorder=recorder, worker_count=len(topology['worker_specs']),
                     model=model,
                     children_ids=role_cfg["children"],
                     child_ranks={child: topology["worker_ranks"].get(child, -1)
@@ -222,8 +233,8 @@ def main(config_file='config.yaml', *, node_id, metrics_dir=None):
                 server.run()
 
             case Role.EDGE_PS:
-                server = ParameterServer(
-                    recorder=recorder, worker_count=len(topology['worker_specs']),
+                server = server_type(
+                    **server_options, recorder=recorder, worker_count=len(topology['worker_specs']),
                     model=model,
                     children_ids=role_cfg["children"],
                     child_ranks={child: topology["worker_ranks"].get(child, -1)
@@ -248,6 +259,7 @@ def main(config_file='config.yaml', *, node_id, metrics_dir=None):
             case Role.WORKER:
                 n_workers = len(topology["worker_specs"])
                 run_worker(
+                    mode=topology['mode'], trace=topology['trace_communication'],
                     dataset_name=dataset_name, sample_limit=topology["data"]["train_samples"],
                     num_workers=training["num_workers"],
                     data_root=topology["data"]["root"], download=topology["data"]["download"],
@@ -337,18 +349,37 @@ def main(config_file='config.yaml', *, node_id, metrics_dir=None):
                 log('Run completed successfully. Coordinated shutdown completed.')
         finally:
             try:
-                try:
-                    # save final counts and timing even with metrics disabled
-                    if server is not None and server.is_root and (metrics_dir or recorder):
-                        from pathlib import Path
-                        result_dir = Path(metrics_dir) if metrics_dir else recorder.directory
-                        result_dir.mkdir(parents=True, exist_ok=True)
-                        with (result_dir / 'result.json').open('x') as result_file:
-                            json.dump(dict(version=server.version, samples=server.total_samples,
-                                           contributions=server.applied_contributions,
-                                           elapsed=server.update_elapsed), result_file)
-                finally:
-                    if recorder:
-                        recorder.close()
+                if server is not None and server.is_root and lifecycle is not None:
+                    reports = lifecycle.work_reports
+                    workers = set(topology['worker_specs'])
+                    if workers <= reports.keys() and all(reports[w] is not None for w in workers):
+                        contributions = sum(reports[w]['contributions'] for w in workers)
+                        samples = sum(reports[w]['samples'] for w in workers)
+                        partial = sum(reports[w]['partial_samples'] for w in workers)
+                        if recorder:
+                            recorder.record('accounting', server.applied_contributions, server.total_samples,
+                                            contributions - server.applied_contributions, samples - server.total_samples, partial)
+                        log(f'[TRAIN] applied_contributions={server.applied_contributions} applied_samples={server.total_samples} '
+                            f'discarded_contributions={contributions - server.applied_contributions} '
+                            f'discarded_samples={samples - server.total_samples} partial_discarded_samples={partial}')
+                    else:
+                        if recorder:
+                            recorder.record('accounting', server.applied_contributions, server.total_samples, None, None, None)
+                        log('[TRAIN] discarded work unknown: incomplete worker shutdown reports')
             finally:
-                ctx.destroy(linger=0)
+                try:
+                    try:
+                        # save final counts and timing even with metrics disabled
+                        if server is not None and server.is_root and (metrics_dir or recorder):
+                            from pathlib import Path
+                            result_dir = Path(metrics_dir) if metrics_dir else recorder.directory
+                            result_dir.mkdir(parents=True, exist_ok=True)
+                            with (result_dir / 'result.json').open('x') as result_file:
+                                json.dump(dict(version=server.version, samples=server.total_samples,
+                                               contributions=server.applied_contributions,
+                                               elapsed=server.update_elapsed), result_file)
+                    finally:
+                        if recorder:
+                            recorder.close()
+                finally:
+                    ctx.destroy(linger=0)

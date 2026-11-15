@@ -3,6 +3,7 @@ import time
 import numpy as np
 from data import load_datasets, limit_dataset, build_train_loader
 from protocol import ParamSerializer, Msg, decode_packet, decode_assignment, encode_packet, encode_version, decode_evaluation
+from protocol import encode_async_gradients, decode_async_params
 from timetree import TimeTree
 from transport import send_message, receive_message, close_sockets
 
@@ -155,7 +156,7 @@ def run_evaluator(pull_sock, push_sock, model, accuracy_threshold=0.90, time_lim
 
 def run_worker(dealer_sock, model, n_workers, batch_size=32, n_epochs=1, local_steps=1,
                *, worker_rank, seed=0, log, node_id, lifecycle=None, data_root="/mnt/data", download=False,
-               dataset_name="cifar10", sample_limit=None, num_workers=2):
+               dataset_name="cifar10", sample_limit=None, num_workers=2, mode="sync", trace=False):
     import torch
     send = send_message if lifecycle is None else lifecycle.send
     receive = receive_message if lifecycle is None else lifecycle.receive
@@ -168,23 +169,58 @@ def run_worker(dealer_sock, model, n_workers, batch_size=32, n_epochs=1, local_s
     serializer = ParamSerializer(model)
     gradients = np.empty(serializer.n_params, dtype=np.float32)
     loss_fn = torch.nn.CrossEntropyLoss(reduction='sum')
-    expected_version = 0
+    if mode not in ('sync', 'async'):
+        raise ValueError('invalid worker mode')
+    asynchronous = mode == 'async'
     timer = TimeTree(print_func=log)
+    expected_version = 0
+    source_version = 0
+    produced = dict(contributions=0, samples=0, partial_samples=0)
+    if lifecycle:
+        lifecycle.work_report = produced
 
     def receive_snapshot():
+        nonlocal source_version
         with timer.measure('wait_recv'):
             _, kind, payload = receive(dealer_sock)
         if kind == bytes([Msg.STOP]):
             return False
-        if kind != bytes([Msg.PUSH_PARAMS]):
+        if kind != bytes([Msg.ASYNC_PARAMS if asynchronous else Msg.PUSH_PARAMS]):
             raise ValueError('worker expected a root snapshot or STOP')
-        version, _, params = decode_packet(payload, serializer.n_params)
-        if version != expected_version:
-            raise ValueError('worker received an unexpected model version')
+        if asynchronous:
+            request, version, params = decode_async_params(payload, serializer.n_params)
+            if request != expected_version or (request == 0 and version != 0) or (request > 0 and version <= source_version):
+                raise ValueError('worker received an unmatched async reply')
+            source_version = version
+            if trace:
+                log(f'[COMM] t={time.monotonic():.6f} event=reply request={request} version={version}')
+        else:
+            version, _, params = decode_packet(payload, serializer.n_params)
+            if version != expected_version:
+                raise ValueError('worker received an unexpected model version')
         serializer.load_params(params)
         if lifecycle:
-            lifecycle.begin_round()
+            if asynchronous:
+                lifecycle.deadline = None
+            else:
+                lifecycle.begin_round()
         return True
+
+    def send_gradients(samples):
+        nonlocal expected_version
+        request = expected_version + 1
+        serializer.flatten_grads_into(gradients)
+        produced['contributions'] += 1
+        produced['samples'] += samples
+        produced['partial_samples'] = 0
+        payload = (encode_async_gradients(request, [(worker_rank, request, source_version, samples)], gradients)
+                   if asynchronous else encode_packet(expected_version, gradients, samples))
+        if asynchronous and lifecycle:
+            lifecycle.begin_round()
+        send(dealer_sock, Msg.ASYNC_GRADS if asynchronous else Msg.PUSH_GRADS, payload)
+        if asynchronous and trace:
+            log(f'[COMM] t={time.monotonic():.6f} event=send request={request} source={source_version} samples={samples}')
+        expected_version += 1
 
     try:
         if lifecycle:
@@ -193,7 +229,7 @@ def run_worker(dealer_sock, model, n_workers, batch_size=32, n_epochs=1, local_s
         _, kind, payload = receive(dealer_sock)
         if kind != bytes([Msg.ASSIGN]) or decode_assignment(payload) != worker_rank:
             raise ValueError('assigned rank does not match configured global worker rank')
-        log(f'[WORKER {worker_rank}] registered; {local_steps} microbatches per round')
+        log(f'[WORKER {worker_rank}] registered; {local_steps} microbatches per {"contribution" if asynchronous else "round"}')
         for epoch in range(n_epochs):
             log(f'Epoch {epoch + 1}/{n_epochs}')
             loader.sampler.set_epoch(epoch)
@@ -209,22 +245,17 @@ def run_worker(dealer_sock, model, n_workers, batch_size=32, n_epochs=1, local_s
                 with timer.measure('step'):
                     loss_fn(model(inputs), targets).backward()
                 samples += inputs.size(0)
+                produced['partial_samples'] = samples
                 steps += 1
                 if steps == local_steps:
-                    serializer.flatten_grads_into(gradients)
-                    send(dealer_sock, Msg.PUSH_GRADS,
-                                 encode_packet(expected_version, gradients, samples))
-                    expected_version += 1
+                    send_gradients(samples)
                     steps = samples = 0
             if steps:
-                serializer.flatten_grads_into(gradients)
-                send(dealer_sock, Msg.PUSH_GRADS,
-                             encode_packet(expected_version, gradients, samples))
-                expected_version += 1
+                send_gradients(samples)
         # Acknowledge the final committed round before declaring completion.
         if not receive_snapshot():
             return
-        send(dealer_sock, Msg.DONE, encode_version(expected_version))
+        send(dealer_sock, Msg.ASYNC_DONE if asynchronous else Msg.DONE, encode_version(expected_version))
         _, kind, _ = receive(dealer_sock)
         if kind != bytes([Msg.STOP]):
             raise ValueError('completed worker expected STOP')

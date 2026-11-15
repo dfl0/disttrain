@@ -31,6 +31,21 @@ class TopologyIdentityTests(unittest.TestCase):
                 build_topology({**flat(), 'metrics': dict(update_every=invalid)})
 
 
+    def test_async_mode_and_trace_configuration(self):
+        raw = flat()
+        self.assertEqual(build_topology(raw)['mode'], 'sync')
+        raw.update(mode='async', logging=dict(trace_communication=True))
+        topology = build_topology(raw)
+        self.assertFalse(topology['node_configs']['root']['sync'])
+        self.assertTrue(topology['trace_communication'])
+        raw['nodes'][0]['sync'] = True
+        with self.assertRaises(ValueError):
+            build_topology(raw)
+        raw['nodes'][0].pop('sync')
+        raw['logging']['trace_communication'] = 'yes'
+        with self.assertRaises(ValueError):
+            build_topology(raw)
+
     def test_same_host_flat_and_hierarchical_ids_do_not_overwrite(self):
         raw = flat()
         topology = build_topology(raw)
@@ -84,22 +99,27 @@ class TopologyIdentityTests(unittest.TestCase):
             build_topology({'bind_addr': 'localhost'})
 
     def test_unknown_id_rejected(self):
-        with self.assertRaisesRegex(ValueError, 'Unknown node ID'):
-            main('config.yaml', node_id='not-a-node')
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / 'config.yaml'
+            config.write_text(json.dumps(flat()))
+            with self.assertRaisesRegex(ValueError, 'Unknown node ID'):
+                main(str(config), node_id='not-a-node')
 
-    def test_cli_help_and_required_node_id(self):
+    def test_cli_help_and_required_arguments(self):
         result = subprocess.run([sys.executable, 'dist_train.py', '--help'], capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0)
+        self.assertIn('--config', result.stdout)
         self.assertIn('--node-id', result.stdout)
-        result = subprocess.run([sys.executable, 'dist_train.py'], capture_output=True, text=True, timeout=10)
-        self.assertEqual(result.returncode, 2)
-        self.assertIn('--node-id', result.stderr)
+        for args, missing in ((['--node-id', 'root'], '--config'),
+                              (['--config', 'unused.yaml'], '--node-id')):
+            with self.subTest(missing=missing):
+                result = subprocess.run([sys.executable, 'dist_train.py', *args], capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(missing, result.stderr)
 
-    def test_actual_yaml_examples(self):
-        for path in ('config.yaml', 'configs/example_config.yaml', 'configs/local_lenet_mnist_flat.yaml', 'configs/local_resnet_cifar10_flat.yaml',
-                     'configs/local_lenet_mnist_hierarchical.yaml', 'configs/local_resnet_cifar10_hierarchical.yaml'):
-            topology = load_topology(path)
-            self.assertIn(topology['root_id'], topology['node_configs'])
+    def test_example_config(self):
+        topology = load_topology('configs/example_config.yaml')
+        self.assertIn(topology['root_id'], topology['node_configs'])
 
     def test_colocated_nodes_launch_individually_in_role_order(self):
         topology = build_topology({

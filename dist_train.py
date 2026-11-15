@@ -5,7 +5,7 @@ from runtime import main
 
 def cli(argv=None):
     parser = argparse.ArgumentParser(description="Launch one explicitly identified training process")
-    parser.add_argument('--config', default='config.yaml')
+    parser.add_argument('--config', required=True)
     parser.add_argument('--node-id', required=True)
     parser.add_argument('--metrics-dir', help='per-node CSV output directory (must not already exist)')
     args = parser.parse_args(argv)

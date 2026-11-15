@@ -14,6 +14,8 @@ SCHEMAS = {
                   'host_throttled_since_boot', 'host_network_interface',
                   'host_network_tx_bytes_per_s', 'host_network_rx_bytes_per_s'),
     'temperatures': ('t_s', 'group', 'label', 'celsius'),
+    'accounting': ('applied_contributions', 'applied_samples', 'discarded_contributions',
+                   'discarded_samples', 'partial_discarded_samples'),
     'overhead': ('component', 'calls', 'wall_s', 'cpu_s'),
     'recording_window': ('elapsed_s',),
     'recording': ('records', 'queue_full_events', 'queue_wait_s', 'complete'),

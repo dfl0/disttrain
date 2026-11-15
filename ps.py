@@ -10,12 +10,16 @@ from timetree import TimeTree
 
 
 class ParameterServer:
+    synchronous = True
+    gradient_message = Msg.PUSH_GRADS
+    snapshot_message = Msg.PUSH_PARAMS
+    done_message = Msg.DONE
     def __init__(self, model, children_ids, sync, router_sock, serializer, init_params,
                  *, child_ranks, parent=None, dealer_sock=None, stop_sock=None,
                  eval_push_sock=None, lr=0.01, eval_interval=200, global_state=None,
                  log=print, node_id=None, lifecycle=None, max_rounds=None, log_interval=10, recorder=None, worker_count=None):
-        if sync is not True:
-            raise ValueError('only synchronous root-only optimization is supported')
+        if sync is not self.synchronous:
+            raise ValueError('server implementation does not match configured mode')
         if not children_ids or len(set(children_ids)) != len(children_ids):
             raise ValueError('server requires nonempty unique children')
         if set(child_ranks) != set(children_ids):
@@ -72,7 +76,7 @@ class ParameterServer:
                 self.lifecycle.begin_round()
             self.training_started = time.perf_counter()
             if self.is_root:
-                self.log('[TRAIN] ready; waiting for first round')
+                self.log(f'[TRAIN] ready; waiting for first {"round" if self.synchronous else "update"}')
             self._event_loop()
         finally:
             self._shutdown()
@@ -87,9 +91,9 @@ class ParameterServer:
             if kind != bytes([Msg.ASSIGN]) or decode_assignment(payload) != -1:
                 raise ValueError('edge expected its registration acknowledgement')
             _, kind, payload = self.receive(self._dealer)
-            if kind != bytes([Msg.PUSH_PARAMS]):
+            if kind != bytes([self.snapshot_message]):
                 raise ValueError('edge expected initial root snapshot')
-            version, _, params = decode_packet(payload, self.flat_params.size)
+            version, params = self._decode_initial_snapshot(payload)
             if version != 0:
                 raise ValueError('initial snapshot must be version zero')
             self.flat_params[:] = params
@@ -103,6 +107,10 @@ class ParameterServer:
             self.registered.add(child_id)
             self.send(self._router, Msg.ASSIGN, encode_assignment(self.child_ranks[child_id]), identity=identity)
         self._broadcast_snapshot()
+
+    def _decode_initial_snapshot(self, payload):
+        version, _, params = decode_packet(payload, self.flat_params.size)
+        return version, params
 
     def _event_loop(self):
         poller = zmq.Poller()
@@ -120,17 +128,17 @@ class ParameterServer:
                     if kind == bytes([Msg.STOP]):
                         self._dispatch_stop()
                         break
-                    if self.is_root or kind != bytes([Msg.PUSH_PARAMS]):
+                    if self.is_root or kind != bytes([self.snapshot_message]):
                         raise ValueError('unexpected control message')
                     self._dispatch_parent_push(payload)
-                if self._router in sockets:
+                if not self.stopped and self._router in sockets:
                     identity, kind, payload = self.receive(self._router, routed=True)
                     child_id = identity.decode('utf-8')
                     if child_id not in self.registered:
                         raise ValueError('message from an unregistered child')
-                    if kind == bytes([Msg.PUSH_GRADS]):
+                    if kind == bytes([self.gradient_message]):
                         self._accept_contribution(child_id, payload)
-                    elif kind == bytes([Msg.DONE]):
+                    elif kind == bytes([self.done_message]):
                         self._accept_done(child_id, payload)
                     else:
                         raise ValueError('unexpected child message')
