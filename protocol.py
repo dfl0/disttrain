@@ -84,6 +84,26 @@ def decode_version(payload):
     return _VERSION.unpack(payload)[0]
 
 
+_EVAL_METADATA = struct.Struct('!Qd')
+
+
+def encode_evaluation(version, samples, elapsed, values):
+    encode_version(samples)
+    if not np.isfinite(elapsed) or elapsed < 0:
+        raise ValueError('invalid evaluation snapshot time')
+    return _EVAL_METADATA.pack(samples, elapsed) + encode_packet(version, values)
+
+
+def decode_evaluation(payload, n_params):
+    if len(payload) < _EVAL_METADATA.size:
+        raise ValueError('truncated evaluation metadata')
+    samples, elapsed = _EVAL_METADATA.unpack_from(payload)
+    if not np.isfinite(elapsed) or elapsed < 0:
+        raise ValueError('invalid evaluation snapshot time')
+    version, _, params = decode_packet(payload[_EVAL_METADATA.size:], n_params)
+    return version, samples, elapsed, params
+
+
 class ParamSerializer:
     """Parameter-only dense contiguous CPU/float32 serialization.
 

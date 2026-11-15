@@ -5,7 +5,6 @@ import shutil
 import socket
 import subprocess
 import threading
-import warnings
 from dataclasses import dataclass, field
 
 from protocol import Role, ParamSerializer
@@ -42,7 +41,6 @@ class RuntimeContext:
         print(f"{prefix}{indent_str}{msg}", flush=True)
 
 
-# ----  utility functions  ---------------------------------------------------+
 
 
 def determine_role(node_id, topology):
@@ -54,7 +52,7 @@ def determine_role(node_id, topology):
     return result
 
 
-def collect_sys_metrics(stop_event, context, log, interval, interface=None):
+def collect_sys_metrics(stop_event, context, log, interval, interface=None, recorder=None, console=False):
     """Periodic host observations, not operation timings. None means unavailable."""
     import psutil
 
@@ -73,8 +71,9 @@ def collect_sys_metrics(stop_event, context, log, interval, interface=None):
     throttle_command = shutil.which('vcgencmd')
     previous_net = observe(net_bytes)
     previous_time = time.perf_counter()
-    observe(lambda: psutil.cpu_percent(interval=None))  # Prime interval CPU measurement.
+    observe(lambda: psutil.cpu_percent(interval=None))  # prime the CPU measurement
     while not stop_event.wait(interval):
+        sample_started = time.perf_counter() if recorder and recorder.measure_overhead else None
         current_net = observe(net_bytes)
         now = time.perf_counter()
         elapsed = now - previous_time
@@ -103,26 +102,31 @@ def collect_sys_metrics(stop_event, context, log, interval, interface=None):
                 throttled_now = bool(value & (1 << 2))
                 throttled_before = bool(value & (1 << 18))
             except (OSError, subprocess.SubprocessError, ValueError):
-                # Avoid repeatedly launching a failing command at high sample rates.
+                # stop retrying a failing command
                 throttle_command = None
         if stop_event.is_set():
             break
-        log('[METRICS] ' + json.dumps(dict(
-            t_s=now - context.start_time, interval_s=elapsed,
-            sample_end_s=time.perf_counter() - context.start_time,
-            host_cpu_percent=cpu,
-            host_cpu_frequency_mhz=frequency.current if frequency else None,
-            host_memory_percent=memory.percent if memory else None,
-            process_rss_bytes=rss, host_temperatures=temperatures,
-            host_throttled_now=throttled_now, host_throttled_since_boot=throttled_before,
-            host_network_interface=interface if interface is not None else 'all',
-            host_network_tx_bytes_per_s=tx, host_network_rx_bytes_per_s=rx)))
+        values = (
+            now - context.start_time, elapsed, time.perf_counter() - context.start_time,
+            cpu, frequency.current if frequency else None,
+            memory.percent if memory else None, rss, throttled_now, throttled_before,
+            interface if interface is not None else 'all', tx, rx)
+        if sample_started is not None:
+            recorder.measure('resource_sampling', time.perf_counter() - sample_started)
+        if recorder:
+            recorder.record('resources', *values)
+            for group, sensors in (temperatures or {}).items():
+                for sensor in sensors:
+                    recorder.record('temperatures', values[0], group, sensor['label'], sensor['celsius'])
+        if console:
+            from metrics import SCHEMAS
+            log('[METRICS] ' + json.dumps(dict(zip(SCHEMAS['resources'], values))))
 
 
-# ----  role functions  ------------------------------------------------------+
 
 
-def main(config_file='config.yaml', *, node_id):
+
+def main(config_file='config.yaml', *, node_id, metrics_dir=None):
     topology = load_topology(config_file)
     role_cfg = determine_role(node_id, topology)
     role = role_cfg["role"]
@@ -131,7 +135,7 @@ def main(config_file='config.yaml', *, node_id):
     from lifecycle import Lifecycle, RunStopped, RunFailed, failure_report
     from ps import ParameterServer
     from models import (
-        LeNet, LeNetCIFAR, AlexNetCIFAR, ResNet20CIFAR, BasicBlock,
+        LeNet, ResNet20CIFAR, BasicBlock,
         disable_state, init_params,
     )
     from training import run_worker, run_evaluator
@@ -150,10 +154,22 @@ def main(config_file='config.yaml', *, node_id):
     lifecycle = None
     report = ''
     original_error = None
+    server = None
+    recorder = None
+    monitor_errors = []
     try:
         control = open_control_socket(ctx, role, role_cfg, topology, node_id)
         lifecycle = Lifecycle(control, node_id, topology["root_id"],
                               topology["node_configs"], topology["eval_id"], topology["timeouts"])
+        if topology['metrics']['enabled']:
+            from metrics import MetricsRecorder
+            from pathlib import Path
+            import uuid
+            destination = metrics_dir or str(Path('metrics') / f'{node_id}-{uuid.uuid4().hex[:12]}')
+            recorder = MetricsRecorder(destination, update_every=topology['metrics']['update_every'],
+                                       measure_overhead=topology['metrics']['measure_overhead'])
+            log(f'CSV metrics: {destination}')
+            lifecycle.health_check = recorder.check
         sockets = open_role_sockets(ctx, role, role_cfg, topology, node_id)
         import torch
         torch.manual_seed(training["seed"])
@@ -169,15 +185,20 @@ def main(config_file='config.yaml', *, node_id):
         serializer = ParamSerializer(model)
 
         monitoring = topology['monitoring']
-        if monitoring['enabled']:
-            monitor_thread = threading.Thread(
-                target=collect_sys_metrics, args=(monitor_stop, context, log),
-                kwargs=dict(interval=monitoring['interval_s'], interface=monitoring['interface']),
+        if monitoring['enabled'] and (recorder or monitoring['console']):
+            def monitor():
+                try:
+                    collect_sys_metrics(monitor_stop, context, log, monitoring['interval_s'],
+                                        monitoring['interface'], recorder, monitoring['console'])
+                except Exception as error:
+                    monitor_errors.append(error)
+            monitor_thread = threading.Thread(target=monitor,
                 name=f'disttrain-metrics-{node_id}', daemon=True)
             monitor_thread.start()
         match role:
             case Role.ROOT_PS:
-                ParameterServer(
+                server = ParameterServer(
+                    recorder=recorder, worker_count=len(topology['worker_specs']),
                     model=model,
                     children_ids=role_cfg["children"],
                     child_ranks={child: topology["worker_ranks"].get(child, -1)
@@ -197,10 +218,12 @@ def main(config_file='config.yaml', *, node_id):
                     log=log,
                     node_id=node_id,
                     lifecycle=lifecycle,
-                ).run()
+                )
+                server.run()
 
             case Role.EDGE_PS:
-                ParameterServer(
+                server = ParameterServer(
+                    recorder=recorder, worker_count=len(topology['worker_specs']),
                     model=model,
                     children_ids=role_cfg["children"],
                     child_ranks={child: topology["worker_ranks"].get(child, -1)
@@ -219,7 +242,8 @@ def main(config_file='config.yaml', *, node_id):
                     log=log,
                     node_id=node_id,
                     lifecycle=lifecycle,
-                ).run()
+                )
+                server.run()
 
             case Role.WORKER:
                 n_workers = len(topology["worker_specs"])
@@ -242,6 +266,7 @@ def main(config_file='config.yaml', *, node_id):
 
             case Role.EVAL:
                 run_evaluator(
+                    recorder=recorder,
                     dataset_name=dataset_name, sample_limit=topology["data"]["eval_samples"],
                     num_workers=training["num_workers"], seed=training["seed"],
                     data_root=topology["data"]["root"], download=topology["data"]["download"],
@@ -268,7 +293,23 @@ def main(config_file='config.yaml', *, node_id):
         report = ''
         original_error = None
     finally:
-        # Report run status independently of whether coordination succeeds.
+        # stop sampling before closing the recorder
+        monitor_stop.set()
+        if monitor_thread is not None:
+            monitor_thread.join(timeout=2)
+            if monitor_thread.is_alive():
+                monitor_errors.append(TimeoutError('resource sampler did not stop'))
+        try:
+            if recorder:
+                recorder.check()
+            if monitor_errors:
+                raise monitor_errors[0]
+        except Exception as error:
+            from lifecycle import merge_reports
+            report = merge_reports(report, failure_report(f'{node_id}: metrics: {error}'))
+            if original_error is None:
+                original_error = error
+        # report the run outcome even if shutdown fails
         try:
             if lifecycle is None:
                 log('Shutdown coordination unavailable: control setup did not complete.')
@@ -295,14 +336,19 @@ def main(config_file='config.yaml', *, node_id):
             else:
                 log('Run completed successfully. Coordinated shutdown completed.')
         finally:
-            monitor_stop.set()
             try:
-                if monitor_thread is not None and monitor_thread.ident is not None:
-                    monitor_thread.join(timeout=2.0)
-                    if monitor_thread.is_alive():
-                        warnings.warn('metrics thread did not stop within 2 seconds', RuntimeWarning)
+                try:
+                    # save final counts and timing even with metrics disabled
+                    if server is not None and server.is_root and (metrics_dir or recorder):
+                        from pathlib import Path
+                        result_dir = Path(metrics_dir) if metrics_dir else recorder.directory
+                        result_dir.mkdir(parents=True, exist_ok=True)
+                        with (result_dir / 'result.json').open('x') as result_file:
+                            json.dump(dict(version=server.version, samples=server.total_samples,
+                                           contributions=server.applied_contributions,
+                                           elapsed=server.update_elapsed), result_file)
+                finally:
+                    if recorder:
+                        recorder.close()
             finally:
-                # All training sockets belong to this thread/context. Destroy also
-                # closes sockets left by partial setup or exceptions in any role.
-                # Zero linger preserves current best-effort shutdown, not delivery ACKs.
                 ctx.destroy(linger=0)

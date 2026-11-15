@@ -4,7 +4,7 @@ import numpy as np
 import zmq
 
 from protocol import (Msg, MAX_VERSION, decode_packet, encode_packet, encode_assignment,
-                      decode_assignment, encode_version, decode_version)
+                      decode_assignment, encode_version, decode_version, encode_evaluation)
 from transport import send_message, receive_message, close_sockets, drain_socket
 from timetree import TimeTree
 
@@ -13,7 +13,7 @@ class ParameterServer:
     def __init__(self, model, children_ids, sync, router_sock, serializer, init_params,
                  *, child_ranks, parent=None, dealer_sock=None, stop_sock=None,
                  eval_push_sock=None, lr=0.01, eval_interval=200, global_state=None,
-                 log=print, node_id=None, lifecycle=None, max_rounds=None, log_interval=10):
+                 log=print, node_id=None, lifecycle=None, max_rounds=None, log_interval=10, recorder=None, worker_count=None):
         if sync is not True:
             raise ValueError('only synchronous root-only optimization is supported')
         if not children_ids or len(set(children_ids)) != len(children_ids):
@@ -35,6 +35,10 @@ class ParameterServer:
         if type(log_interval) is not int or log_interval <= 0:
             raise ValueError("log_interval must be a positive integer")
         self.log_interval = log_interval
+        self.recorder = recorder
+        self.worker_count = worker_count or len(children_ids)
+        self.applied_contributions = 0
+        self.update_elapsed = 0.0
         self.total_samples = 0
         self.training_started = time.perf_counter()
         self.last_logged_version = -1
@@ -162,6 +166,11 @@ class ParameterServer:
         self.flat_params[:] = updated
         self.version += 1
         self.total_samples += self.sample_count
+        self.applied_contributions += self.worker_count
+        self.update_elapsed = time.perf_counter() - self.training_started
+        if self.recorder:
+            self.recorder.update(self.update_elapsed, self.version, self.total_samples,
+                                 self.applied_contributions, self.sample_count, self.worker_count, 0, 0)
         if self.version == 1 or self.version % self.log_interval == 0:
             self._log_progress()
         self._reset_round()
@@ -228,7 +237,7 @@ class ParameterServer:
 
     def _push_eval(self):
         if self._eval_push is not None:
-            self.send(self._eval_push, Msg.EVAL, encode_packet(self.version, self.flat_params))
+            self.send(self._eval_push, Msg.EVAL, encode_evaluation(self.version, self.total_samples, self.update_elapsed, self.flat_params))
 
     def _dispatch_stop(self):
         self.stopped = True

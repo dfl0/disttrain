@@ -136,6 +136,8 @@ class Lifecycle:
         self.deadline = None if seconds is None else time.monotonic() + seconds
 
     def check(self):
+        if getattr(self, "health_check", None):
+            self.health_check()
         # Control takes priority even when the training socket is already ready.
         while self.socket.poll(0):
             self._handle()

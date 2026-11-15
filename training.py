@@ -2,13 +2,13 @@
 import time
 import numpy as np
 from data import load_datasets, limit_dataset, build_train_loader
-from protocol import ParamSerializer, Msg, decode_packet, decode_assignment, encode_packet, encode_version
+from protocol import ParamSerializer, Msg, decode_packet, decode_assignment, encode_packet, encode_version, decode_evaluation
 from timetree import TimeTree
 from transport import send_message, receive_message, close_sockets
 
 
 def run_evaluator(pull_sock, push_sock, model, accuracy_threshold=0.90, time_limit_s=3600, batch_size=32, *, log, lifecycle=None, data_root="/mnt/data", download=False,
-                  dataset_name="cifar10", sample_limit=None, num_workers=2, seed=0):
+                  dataset_name="cifar10", sample_limit=None, num_workers=2, seed=0, recorder=None):
     import torch
     log("[EVALUATOR]")
     # -- load test data  --
@@ -53,7 +53,7 @@ def run_evaluator(pull_sock, push_sock, model, accuracy_threshold=0.90, time_lim
                 return
             if kind != bytes([Msg.EVAL]):
                 raise ValueError('evaluator expected snapshot or STOP acknowledgement')
-            decode_packet(payload, serializer.n_params)
+            decode_evaluation(payload, serializer.n_params)
 
     start_time = time.perf_counter()
     while True:
@@ -69,11 +69,12 @@ def run_evaluator(pull_sock, push_sock, model, accuracy_threshold=0.90, time_lim
                     break
                 if msg_type != bytes([Msg.EVAL]):
                     raise ValueError('evaluator expected a snapshot or STOP')
-                new_version, _, params = decode_packet(payload, serializer.n_params)
+                new_version, snapshot_samples, snapshot_elapsed, params = decode_evaluation(payload, serializer.n_params)
                 drained += 1
 
                 if new_version > model_version:
                     model_version = new_version
+                    applied_samples, root_elapsed = snapshot_samples, snapshot_elapsed
                     flat_params[:] = params
                     new_params = True
                 else:
@@ -113,6 +114,9 @@ def run_evaluator(pull_sock, push_sock, model, accuracy_threshold=0.90, time_lim
                 test_loss = total_loss / total_samples
 
             done_time = time.perf_counter() - start_time
+            if recorder:
+                recorder.record('evaluations', model_version, applied_samples, root_elapsed,
+                                 recv_time, done_time, test_acc * 100, test_loss, total_samples)
             log('*' * 100)
             log(f"Evaluation (recv'd after {recv_time:.2f}s, done after {done_time:.2f}s): version {model_version}, accuracy: {test_acc:.2%}, loss: {test_loss:.4f}")
             log('*' * 100)

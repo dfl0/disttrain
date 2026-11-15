@@ -13,13 +13,19 @@ from launcher import EXIT_MARKER, remote_result
 LAUNCHER = str(Path(__file__).resolve().parents[1] / 'launcher.py')
 # minimal child program for launcher tests
 PROGRAM = '''
-import argparse, json, signal, time
+import argparse, json, os, signal, time
 p = argparse.ArgumentParser()
 p.add_argument('--config')
 p.add_argument('--node-id')
+p.add_argument('--metrics-dir')
 a = p.parse_args()
 cfg = json.load(open(a.config))
 print('started ' + a.node_id, flush=True)
+if not cfg.get('omit_metrics'):
+    os.makedirs(a.metrics_dir, exist_ok=True)
+    with open(os.path.join(a.metrics_dir, 'recording.csv'), 'w') as file:
+        file.write('records,queue_full_events,queue_wait_s,complete\\n'
+                   '1,0,0.0,' + ('False' if cfg.get('incomplete_metrics') else 'True') + '\\n')
 if cfg.get('fail') and a.node_id == 'worker':
     raise SystemExit(7)
 if cfg.get('hold'):
@@ -63,9 +69,40 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual((self.root / 'logs/done/config.yaml').read_text(), self.config.read_text())
         for node in ('root', 'eval', 'worker'):
             self.assertIn('started ' + node, (self.root / f'logs/done/{node}.log').read_text())
+            self.assertEqual(summary['nodes'][node]['metrics_status'], 'complete')
+            self.assertEqual(summary['nodes'][node]['metrics_files'], ['recording.csv'])
+            self.assertEqual((self.root / f'logs/done/{node}.metrics/recording.csv').read_text(),
+                             'records,queue_full_events,queue_wait_s,complete\n1,0,0.0,True\n')
         repeated = subprocess.run(self.command('done'), capture_output=True, text=True, timeout=10)
         self.assertNotEqual(repeated.returncode, 0)
         self.assertEqual(self.summary('done'), summary)
+
+    def test_missing_metrics_makes_successful_process_an_incomplete_run(self):
+        self.raw['omit_metrics'] = True
+        result = subprocess.run(self.command('missing'), capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        summary = self.summary('missing')
+        self.assertEqual(summary['outcome'], 'failed')
+        self.assertTrue(all(n['exit_code'] == 0 and n['metrics_status'] == 'missing'
+                            for n in summary['nodes'].values()))
+
+    def test_disabled_metrics_do_not_fail_successful_processes(self):
+        self.raw['metrics'] = dict(enabled=False)
+        self.raw['omit_metrics'] = True
+        result = subprocess.run(self.command('disabled'), capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        summary = self.summary('disabled')
+        self.assertEqual(summary['outcome'], 'success')
+        self.assertTrue(all(n['metrics_status'] == 'disabled' and not n['metrics_files']
+                            for n in summary['nodes'].values()))
+
+    def test_incomplete_recording_marker_fails_run(self):
+        self.raw['incomplete_metrics'] = True
+        result = subprocess.run(self.command('incomplete'), capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        summary = self.summary('incomplete')
+        self.assertEqual(summary['outcome'], 'failed')
+        self.assertTrue(all(n['metrics_status'] == 'incomplete' for n in summary['nodes'].values()))
 
     def test_failure_escalates_only_owned_processes(self):
         self.raw.update(hold=True, ignore_signals=True, fail=True)
@@ -125,5 +162,6 @@ class LauncherTests(unittest.TestCase):
         report = remote_result(log, 'test-token')
         self.assertTrue(report['cleanup_confirmed'], log.read_text())
         self.assertIsNotNone(report['exit_code'])
+        self.assertTrue(Path(report['metrics_dir']).parent.is_dir())
         self.assertFalse(remote_result(log, 'wrong-token')['cleanup_confirmed'])
         self.assertIn(EXIT_MARKER, log.read_text())

@@ -134,13 +134,13 @@ def build_topology(raw):
     workload = raw.get('workload', 'resnet_cifar10')
     if workload not in ('resnet_cifar10', 'lenet_mnist'):
         raise ValueError('workload must be resnet_cifar10 or lenet_mnist')
-    monitoring = dict(enabled=True, interval_s=0.5, interface=None)
+    monitoring = dict(enabled=True, interval_s=0.5, interface=None, console=False)
     supplied_monitoring = raw.get('monitoring', {})
     if not isinstance(supplied_monitoring, dict) or supplied_monitoring.keys() - monitoring.keys():
-        raise ValueError('monitoring must be a mapping with enabled, interval_s and/or interface')
+        raise ValueError('monitoring must be a mapping with enabled, interval_s, interface and/or console')
     monitoring.update(supplied_monitoring)
-    if type(monitoring['enabled']) is not bool:
-        raise ValueError('monitoring.enabled must be a boolean')
+    if type(monitoring['enabled']) is not bool or type(monitoring['console']) is not bool:
+        raise ValueError('monitoring.enabled and monitoring.console must be booleans')
     interval = monitoring['interval_s']
     if (isinstance(interval, bool) or not isinstance(interval, (int, float))
             or not math.isfinite(interval) or interval <= 0):
@@ -172,8 +172,19 @@ def build_topology(raw):
         count = data[key]
         if count is not None and (type(count) is not int or count <= 0):
             raise ValueError(f'data.{key} must be a positive integer or null')
+    metrics = dict(enabled=True, update_every=1, measure_overhead=True)
+    supplied_metrics = raw.get('metrics', {})
+    if not isinstance(supplied_metrics, dict) or supplied_metrics.keys() - metrics.keys():
+        raise ValueError('metrics must contain only enabled, update_every, and/or measure_overhead')
+    metrics.update(supplied_metrics)
+    if type(metrics['enabled']) is not bool:
+        raise ValueError('metrics.enabled must be a boolean')
+    if type(metrics['update_every']) is not int or metrics['update_every'] <= 0:
+        raise ValueError('metrics.update_every must be a positive integer')
+    if type(metrics['measure_overhead']) is not bool:
+        raise ValueError('metrics.measure_overhead must be a boolean')
     eval_cfg = raw.get('eval', {})
-    return dict(workload=workload, node_configs=nodes, root_id=root['id'], eval_id=evaluator['id'],
+    return dict(metrics=metrics, workload=workload, node_configs=nodes, root_id=root['id'], eval_id=evaluator['id'],
                 eval_endpoint=evaluator['endpoint'], stop_endpoint=root['stop_endpoint'],
                 worker_specs=workers, worker_ranks=worker_ranks, training=training, data=data, monitoring=monitoring, timeouts=timeouts,
                 eval_accuracy_threshold=eval_cfg.get('accuracy_threshold', 0.90),

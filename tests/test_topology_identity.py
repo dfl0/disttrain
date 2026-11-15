@@ -21,6 +21,16 @@ def flat():
 
 
 class TopologyIdentityTests(unittest.TestCase):
+    def test_metric_recording_controls(self):
+        self.assertEqual(build_topology(flat())['metrics'],
+                         dict(enabled=True, update_every=1, measure_overhead=True))
+        configured = dict(enabled=True, update_every=7, measure_overhead=False)
+        self.assertEqual(build_topology({**flat(), 'metrics': configured})['metrics'], configured)
+        for invalid in (0, -1, True, 1.5):
+            with self.assertRaises(ValueError):
+                build_topology({**flat(), 'metrics': dict(update_every=invalid)})
+
+
     def test_same_host_flat_and_hierarchical_ids_do_not_overwrite(self):
         raw = flat()
         topology = build_topology(raw)
@@ -148,7 +158,7 @@ assert not any(t.name.startswith('disttrain-metrics-') for t in threading.enumer
         from runtime import RuntimeContext, collect_sys_metrics
 
         raw = flat()
-        raw['monitoring'] = dict(enabled=False, interval_s=0.04, interface=None)
+        raw['monitoring'] = dict(enabled=False, interval_s=0.04, interface=None, console=False)
         self.assertEqual(build_topology(raw)['monitoring'], raw['monitoring'])
         for invalid in (None, {'enabled': 1}, {'interval_s': 0},
                         {'interval_s': float('nan')}, {'interface': ''}, {'typo': 1}):
@@ -166,7 +176,7 @@ assert not any(t.name.startswith('disttrain-metrics-') for t in threading.enumer
 
         thread = threading.Thread(target=collect_sys_metrics,
                                   args=(stop, context, record),
-                                  kwargs=dict(interval=0.01, interface='disttrain-nonexistent'))
+                                  kwargs=dict(interval=0.01, interface='disttrain-nonexistent', console=True))
         try:
             thread.start()
             thread.join(timeout=5)

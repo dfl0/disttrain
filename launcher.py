@@ -1,5 +1,6 @@
 """Run nodes locally or over SSH and collect their logs."""
 import argparse
+import csv
 import json
 import os
 from pathlib import Path
@@ -62,12 +63,15 @@ def remote_node():
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGHUP, on_signal)
     try:
+        # keep metrics available for copying after the node exits
+        metrics_dir = str(Path(tempfile.mkdtemp(prefix='disttrain-metrics-')) / 'metrics')
+        result['metrics_dir'] = metrics_dir
         with tempfile.TemporaryDirectory(prefix='disttrain-') as directory:
             config = Path(directory) / 'config.yaml'
             config.write_text(request['config'])
             process = subprocess.Popen(
                 [request['python'], '-u', 'dist_train.py', '--config', str(config),
-                 '--node-id', request['node_id']], stdin=subprocess.DEVNULL,
+                 '--node-id', request['node_id'], '--metrics-dir', metrics_dir], stdin=subprocess.DEVNULL,
                 stderr=subprocess.STDOUT, start_new_session=True)
             with selectors.DefaultSelector() as selector:
                 selector.register(sys.stdin.buffer, selectors.EVENT_READ)
@@ -145,6 +149,63 @@ def remote_result(path, token):
                 error='SSH ended without a remote exit report; remote cleanup unconfirmed')
 
 
+def collect_metrics(output, entries, nodes, *, mode, enabled=True):
+    for host, node, role in entries:
+        target = output / f'{node}.metrics'
+        status = nodes[node]
+        status['metrics'] = target.name
+        if not enabled:
+            if role == 'root_ps':
+                if mode == 'ssh' and status.get('metrics_dir'):
+                    target.mkdir(exist_ok=True)
+                    try:
+                        result = subprocess.run(
+                            ['scp', '-q', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
+                             f'{host}:{status["metrics_dir"]}/result.json', str(target / 'result.json')],
+                            capture_output=True, text=True, timeout=30)
+                        if result.returncode:
+                            status['result_error'] = result.stderr.strip() or f'scp exited {result.returncode}'
+                    except (OSError, subprocess.TimeoutExpired) as error:
+                        status['result_error'] = str(error)
+                status['result_status'] = 'complete' if (target / 'result.json').is_file() else 'missing'
+            status['metrics_files'] = []
+            status['metrics_status'] = 'disabled'
+            continue
+        if mode == 'local':
+            files = sorted(path.name for path in target.glob('*.csv')) if target.is_dir() else []
+        else:
+            remote_dir = status.get('metrics_dir')
+            files = []
+            if remote_dir:
+                target.mkdir(exist_ok=True)
+                # remote_dir comes from mkdtemp on the remote host
+                try:
+                    result = subprocess.run(
+                        ['scp', '-q', '-r', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10',
+                         f'{host}:{remote_dir}/.', str(target)],
+                        capture_output=True, text=True, timeout=30)
+                    if result.returncode:
+                        status['metrics_error'] = result.stderr.strip() or f'scp exited {result.returncode}'
+                    else:
+                        files = sorted(path.name for path in target.glob('*.csv'))
+                except (OSError, subprocess.TimeoutExpired) as error:
+                    status['metrics_error'] = f'{type(error).__name__}: {error}'
+        status['metrics_files'] = files
+        if status.get('metrics_error'):
+            status['metrics_status'] = 'failed'
+        elif 'recording.csv' not in files:
+            status['metrics_status'] = 'missing' if not files else 'incomplete'
+        else:
+            try:
+                with (target / 'recording.csv').open(newline='', encoding='utf-8') as file:
+                    records = list(csv.DictReader(file))
+                status['metrics_status'] = ('complete' if len(records) == 1 and
+                                            records[0].get('complete') == 'True' else 'incomplete')
+            except (OSError, UnicodeError, csv.Error) as error:
+                status['metrics_status'] = 'incomplete'
+                status['metrics_error'] = f'{type(error).__name__}: {error}'
+
+
 def run(args, topology, config_text):
     output = Path(args.output_dir) / args.run_name
     output.mkdir(parents=True, exist_ok=False)
@@ -189,7 +250,7 @@ def run(args, topology, config_text):
                 files[node] = log_path.open('wb')
                 if args.mode == 'local':
                     command = [args.python, '-u', 'dist_train.py', '--config', str(config_path.resolve()),
-                               '--node-id', node]
+                               '--node-id', node, '--metrics-dir', str((output / f'{node}.metrics').resolve())]
                 else:
                     tokens[node] = uuid.uuid4().hex
                     remote = f'cd {shlex.quote(args.workdir)} && exec {shlex.join([args.python, "-u", "launcher.py", "--remote-node"])}'
@@ -279,6 +340,11 @@ def run(args, topology, config_text):
                 process.stdin.close()
         for file in files.values():
             file.close()
+        collect_metrics(output, entries, nodes, mode=args.mode,
+                        enabled=topology.get('metrics', {}).get('enabled', True))
+        for node, status in nodes.items():
+            if status['exit_code'] == 0 and status['metrics_status'] not in ('complete', 'disabled'):
+                failure = failure or f'{node} metrics collection {status["metrics_status"]}'
         outcome = 'interrupted' if interrupted else 'failed' if failure else 'success'
         summary = dict(outcome=outcome, error=failure, mode=args.mode, started_at=started,
                        finished_at=time.time(), workdir=args.workdir, python=args.python, nodes=nodes)

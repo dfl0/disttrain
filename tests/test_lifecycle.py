@@ -142,7 +142,9 @@ def run_small_runtime(config_path, node_id, results, interrupt_worker=False, sma
     training.load_datasets = load_data
     output = io.StringIO()
     with contextlib.redirect_stdout(output):
-        status = cli(['--config', config_path, '--node-id', node_id])
+        from pathlib import Path
+        status = cli(['--config', config_path, '--node-id', node_id,
+                      '--metrics-dir', str(Path(config_path).parent / f'{node_id}.metrics')])
     text = output.getvalue()
     assert 'Coordinated shutdown completed.' in text, text
     assert 'INCOMPLETE' not in text and 'Traceback' not in text, text
@@ -159,7 +161,7 @@ def run_small_runtime(config_path, node_id, results, interrupt_worker=False, sma
 
 
 class RuntimeLifecycleTests(unittest.TestCase):
-    def run_hierarchy(self, interrupt_worker=False, small_workload=False):
+    def run_hierarchy(self, interrupt_worker=False, small_workload=False, metrics_enabled=True):
         import json
         import multiprocessing
         import socket
@@ -175,7 +177,7 @@ class RuntimeLifecycleTests(unittest.TestCase):
             for sock in reservations:
                 sock.close()
         root, control, edge, evaluator = endpoints
-        raw = dict(monitoring=dict(enabled=False),
+        raw = dict(monitoring=dict(enabled=False), metrics=dict(enabled=metrics_enabled),
                    data=dict(root="./test-data", download=True),
                    timeouts=dict(startup_s=30, shutdown_s=10),
                    training=dict(batch_size=2, n_epochs=1, eval_interval=200),
@@ -211,6 +213,22 @@ class RuntimeLifecycleTests(unittest.TestCase):
                     self.assertEqual(codes, [0] * 4)
                     self.assertEqual(dict(results.get(timeout=2) for _ in processes),
                                      dict(root='ok', edge='ok', worker='ok', eval='ok'))
+                    final = json.loads((Path(directory) / 'root.metrics' / 'result.json').read_text())
+                    self.assertGreater(final['elapsed'], 0)
+                    if not metrics_enabled:
+                        self.assertEqual((final['version'], final['samples']), (1, 2))
+                        self.assertFalse(list(Path(directory).glob('*.metrics/*.csv')))
+                        return
+                    import csv
+                    with (Path(directory) / 'root.metrics' / 'updates.csv').open() as file:
+                        updates = list(csv.DictReader(file))
+                    with (Path(directory) / 'eval.metrics' / 'evaluations.csv').open() as file:
+                        evaluations = list(csv.DictReader(file))
+                    self.assertTrue(updates and evaluations)
+                    self.assertEqual(len(updates), int(updates[-1]['version']))
+                    self.assertEqual(evaluations[-1]['samples'], updates[-1]['samples'])
+                    self.assertEqual(evaluations[-1]['version'], updates[-1]['version'])
+                    self.assertEqual(evaluations[-1]['root_elapsed'], updates[-1]['elapsed'])
             finally:
                 for process in processes:
                     if process.is_alive():
@@ -228,3 +246,6 @@ class RuntimeLifecycleTests(unittest.TestCase):
 
     def test_mnist_round_limit_and_final_evaluation(self):
         self.run_hierarchy(small_workload=True)
+
+    def test_metrics_disabled_keeps_exact_final_result(self):
+        self.run_hierarchy(small_workload=True, metrics_enabled=False)
