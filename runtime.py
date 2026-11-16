@@ -1,4 +1,4 @@
-"""Per-run setup/cleanup and telemetry; resource throttling is temporarily disabled."""
+"""Set up and run a training node."""
 import time
 import json
 import shutil
@@ -190,7 +190,8 @@ def main(config_file, *, node_id, metrics_dir=None):
             monitor_thread.start()
         server_type = ParameterServer
         server_options = {}
-        if topology['mode'] == 'async':
+        # mixed policies require contribution records on every training link
+        if not topology["fully_synchronous"]:
             from async_ps import AsyncParameterServer
             server_type = AsyncParameterServer
             groups = {child: ({topology['worker_ranks'][child]} if child in topology['worker_ranks']
@@ -251,7 +252,7 @@ def main(config_file, *, node_id, metrics_dir=None):
                 n_workers = len(topology["worker_specs"])
                 run_worker(
                     recorder=recorder,
-                    mode=topology['mode'], trace=topology['trace_communication'],
+                    mode="sync" if topology["fully_synchronous"] else "async", trace=topology["trace_communication"],
                     dataset_name=dataset_name, sample_limit=topology["data"]["train_samples"],
                     num_workers=training["num_workers"],
                     data_root=topology["data"]["root"], download=topology["data"]["download"],

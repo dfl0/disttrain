@@ -1,4 +1,4 @@
-"""Synchronous round arithmetic and admission with real tensors and sockets."""
+"""Test synchronous aggregation and message validation."""
 from contextlib import contextmanager, ExitStack
 import unittest
 
@@ -13,7 +13,7 @@ from transport import open_control_socket, send_message, receive_message, open_r
 
 
 @contextmanager
-def server(children=('w0', 'w1'), ranks=None, edge=False, asynchronous=False, groups=None):
+def server(children=("w0", "w1"), ranks=None, edge=False, asynchronous=False, groups=None, sync=False):
     context = zmq.Context()
     router = context.socket(zmq.ROUTER)
     router.setsockopt(zmq.RCVTIMEO, 2000)
@@ -48,7 +48,7 @@ def server(children=('w0', 'w1'), ranks=None, edge=False, asynchronous=False, gr
             from async_ps import AsyncParameterServer
             server_type = AsyncParameterServer
             options = dict(reference_samples=8, worker_groups=groups or {name: {i} for i, name in enumerate(children)})
-        ps = server_type(model, children, not asynchronous, router, ParamSerializer(model), lambda module: None,
+        ps = server_type(model, children, sync if asynchronous else True, router, ParamSerializer(model), lambda module: None,
                              **options,
                              child_ranks=ranks or {name: i for i, name in enumerate(children)},
                              parent='root' if edge else None, dealer_sock=dealer,

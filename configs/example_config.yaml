@@ -1,5 +1,6 @@
-# Host is an SSH destination, not a role/registration identity.
-# Unthrottled example: cpu/bw limits are rejected until resource ownership is repaired.
+# host specifies the SSH destination
+# CPU and bandwidth limits are not supported
+mode: async
 nodes:
   - id: root
     role: root_ps
@@ -8,6 +9,7 @@ nodes:
     bind_endpoint: tcp://*:5550
     stop_endpoint: tcp://192.168.1.1:5551
     stop_bind_endpoint: tcp://*:5551
+    mode: sync
   - id: edge-a
     role: edge_ps
     host: 192.168.1.2

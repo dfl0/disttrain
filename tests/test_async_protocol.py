@@ -79,6 +79,55 @@ class AsyncProtocolTests(unittest.TestCase):
             self.assertEqual(root.weighted_staleness, 1)
             np.testing.assert_allclose(root.flat_params, [-0.125])
 
+    def test_sync_root_barrier_subset_staleness_and_completed_edge(self):
+        with server(children=("e0", "e1"), ranks={"e0": -1, "e1": -1},
+                    asynchronous=True, sync=True, groups={"e0": {0, 1}, "e1": {2}}) as (root, peers, _):
+            initial(peers)
+            root._accept_contribution("e0", packet(0, samples=1, gradient=2))
+            self.assertEqual(root.version, 0)
+            self.assertFalse(peers["e0"].poll(0))
+            with self.assertRaises(ValueError):
+                root._accept_done("e0", encode_version(1))
+            root._accept_contribution("e1", packet(2, samples=2, gradient=6))
+            np.testing.assert_allclose(root.flat_params, [-.1])  # fixed 8, not actual 3
+            for peer in peers.values():
+                self.assertEqual(decode_async_params(receive_message(peer)[2], 1)[:2], (1, 1))
+            # e0 forwards another worker's contribution from the initial snapshot
+            root._accept_contribution("e0", encode_async_gradients(
+                2, [(1, 1, 0, 1)], np.array([4], dtype=np.float32)))
+            self.assertEqual(root.version, 1)
+            root._accept_done("e1", encode_version(1))  # shrinking releases pending barrier
+            self.assertEqual(root.version, 2)
+            self.assertEqual(root.weighted_staleness, 1)
+            self.assertEqual(root.applied_contributions, 3)
+            np.testing.assert_allclose(root.flat_params, [-.15])
+            self.assertEqual(decode_async_params(receive_message(peers["e0"])[2], 1)[:2], (2, 2))
+            root._accept_done("e0", encode_version(2))
+            self.assertTrue(root.stopped)
+
+    def test_sync_edge_waits_and_releases_together_across_root_version_jumps(self):
+        with server(edge=True, asynchronous=True, sync=True) as (edge, peers, parent):
+            initial(peers)
+            edge._accept_contribution("w0", packet(0))
+            self.assertFalse(parent.poll(0))
+            edge._accept_contribution("w1", packet(1, samples=1, gradient=2))
+            request, records, gradients = decode_async_gradients(receive_message(parent)[2], 1)
+            self.assertEqual((request, len(records)), (1, 2))
+            np.testing.assert_array_equal(gradients, [6])
+            self.assertFalse(any(peer.poll(0) for peer in peers.values()))
+            edge._dispatch_parent_push(encode_async_params(1, 3, np.array([1], dtype=np.float32)))
+            for peer in peers.values():
+                self.assertEqual(decode_async_params(receive_message(peer)[2], 1)[:2], (1, 3))
+            edge._accept_contribution("w1", packet(1, contribution=2, source=3))
+            self.assertFalse(parent.poll(0))
+            edge._accept_done("w0", encode_version(1))
+            self.assertEqual(decode_async_gradients(receive_message(parent)[2], 1)[0], 2)
+            edge._dispatch_parent_push(encode_async_params(2, 5, np.array([2], dtype=np.float32)))
+            self.assertFalse(peers["w0"].poll(0), "finished workers get no further snapshots")
+            self.assertEqual(decode_async_params(receive_message(peers["w1"])[2], 1)[:2], (2, 5))
+            edge._accept_done("w1", encode_version(2))
+            self.assertEqual(receive_message(parent)[1:], (bytes([Msg.ASYNC_DONE]), encode_version(2)))
+
     def test_codec_rejects_truncation_duplicate_records_and_nonfinite_values(self):
         valid = packet(0)
         for payload in (valid[:-1], valid + b'x', b'', b'xxxx' + valid[4:]):

@@ -1,4 +1,4 @@
-"""Topology validation and focused runtime startup/monitoring checks."""
+"""Test topology validation and runtime setup."""
 import subprocess
 import json
 import tempfile
@@ -47,6 +47,8 @@ class TopologyIdentityTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_topology(raw)
         raw['nodes'][0].pop('sync')
+        raw["nodes"][0]["mode"] = "sync"
+        self.assertTrue(build_topology(raw)["fully_synchronous"])
         raw['logging']['trace_communication'] = 'yes'
         with self.assertRaises(ValueError):
             build_topology(raw)
@@ -78,6 +80,8 @@ class TopologyIdentityTests(unittest.TestCase):
             lambda r: r['nodes'][2].update(cpu=50),
             lambda r: r['nodes'][2].update(bw='10mbit'),
             lambda r: r['nodes'][0].update(sync=False),
+            lambda r: r["nodes"][0].update(mode="invalid"),
+            lambda r: r["nodes"][2].update(mode="async"),
             lambda r: r.update(training={'local_steps': 0}),
             lambda r: r['nodes'][2].update(worker_rank=9),
             lambda r: r['nodes'].append(dict(r['nodes'][2])),

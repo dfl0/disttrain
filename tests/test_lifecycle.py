@@ -1,4 +1,4 @@
-"""Real ZeroMQ lifecycle checks; no fake sockets, clocks, or training libraries."""
+"""Test lifecycle coordination and shutdown."""
 import queue
 import threading
 import time
@@ -119,8 +119,8 @@ class LifecycleTests(unittest.TestCase):
         self.exchange(missing_ack=True, interrupt_root=True)
 
 
-def run_small_runtime(config_path, node_id, results, interrupt_worker=False, small_workload=False, asynchronous=False, flat=False, capped=True):
-    """Real runtime/ResNet/autograd; only the CIFAR data source is synthetic."""
+def run_small_runtime(config_path, node_id, results, interrupt_worker=False, small_workload=False, asynchronous=False, flat=False, capped=True, expected_work=None):
+    """Run training with synthetic CIFAR data."""
     import torch
     import training
     from dist_train import cli
@@ -157,8 +157,13 @@ def run_small_runtime(config_path, node_id, results, interrupt_worker=False, sma
             assert ('[TRAIN] update=1 applied_samples=' if asynchronous else '[TRAIN] round=1 samples=') in text, text
             if asynchronous:
                 assert 'discarded_contributions=' in text, text
-                assert ('applied_contributions=1 applied_samples=2' if capped
-                        else 'applied_contributions=4 applied_samples=6') in text, text
+                if expected_work is not None:
+                    if not capped:
+                        contributions, samples = expected_work
+                        assert f'applied_contributions={contributions} applied_samples={samples}' in text, text
+                else:
+                    assert ("applied_contributions=1 applied_samples=2" if capped
+                            else "applied_contributions=4 applied_samples=6") in text, text
                 if not capped:
                     assert 'discarded_contributions=0 discarded_samples=0 partial_discarded_samples=0' in text, text
         results.put((node_id, 'ok'))
@@ -167,14 +172,14 @@ def run_small_runtime(config_path, node_id, results, interrupt_worker=False, sma
 
 
 class RuntimeLifecycleTests(unittest.TestCase):
-    def run_hierarchy(self, interrupt_worker=False, small_workload=False, asynchronous=False, flat=False, capped=True, metrics_enabled=True):
+    def run_hierarchy(self, interrupt_worker=False, small_workload=False, asynchronous=False, flat=False, capped=True, metrics_enabled=True, policies=None):
         import json
         import multiprocessing
         import socket
         import tempfile
         from pathlib import Path
 
-        reservations = [socket.socket() for _ in range(4)]
+        reservations = [socket.socket() for _ in range(5)]
         try:
             for sock in reservations:
                 sock.bind(('127.0.0.1', 0))
@@ -182,7 +187,7 @@ class RuntimeLifecycleTests(unittest.TestCase):
         finally:
             for sock in reservations:
                 sock.close()
-        root, control, edge, evaluator = endpoints
+        root, control, edge, evaluator, edge2 = endpoints
         raw = dict(monitoring=dict(enabled=False), metrics=dict(enabled=metrics_enabled),
                    data=dict(root="./test-data", download=True),
                    timeouts=dict(startup_s=30, shutdown_s=10),
@@ -206,12 +211,20 @@ class RuntimeLifecycleTests(unittest.TestCase):
                 for node in raw['nodes']:
                     if node['role'] == 'worker':
                         node['parent'] = 'root'
+        if policies:
+            raw["nodes"][0]["mode"] = policies[0]
+            raw["nodes"][1]["mode"] = policies[1]
+            raw["nodes"].extend([
+                dict(id="edge2", role="edge_ps", host="127.0.0.1", endpoint=edge2,
+                     parent="root", mode=policies[2]),
+                dict(id="worker3", role="worker", host="127.0.0.1", parent="edge2")])
+            raw["data"]["train_samples"] = 7  # padded to 9: each worker sends 2 + 1 samples
         spawn = multiprocessing.get_context('spawn')
         results = spawn.Queue()
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'config.yaml'
             path.write_text(json.dumps(raw))
-            processes = [spawn.Process(target=run_small_runtime, args=(str(path), node['id'], results, interrupt_worker, small_workload, asynchronous, flat, capped))
+            processes = [spawn.Process(target=run_small_runtime, args=(str(path), node["id"], results, interrupt_worker, small_workload, asynchronous, flat, capped, (6, 9) if policies else None))
                          for node in raw['nodes']]
             try:
                 for process in processes:
@@ -230,6 +243,11 @@ class RuntimeLifecycleTests(unittest.TestCase):
                                      {node['id']: 'ok' for node in raw['nodes']})
                     final = json.loads((Path(directory) / 'root.metrics' / 'result.json').read_text())
                     self.assertGreater(final['elapsed'], 0)
+                    if policies:
+                        if capped:
+                            self.assertEqual(final["version"], 1)
+                        else:
+                            self.assertEqual((final["samples"], final["contributions"]), (9, 6))
                     if not metrics_enabled:
                         self.assertEqual((final['version'], final['samples']), (1, 2))
                         self.assertFalse(list(Path(directory).glob('*.metrics/*.csv')))
@@ -275,6 +293,15 @@ class RuntimeLifecycleTests(unittest.TestCase):
         for flat, capped in ((True, False), (False, False), (False, True)):
             with self.subTest(flat=flat, capped=capped):
                 self.run_hierarchy(small_workload=True, asynchronous=True, flat=flat, capped=capped)
+
+    def test_mixed_policies_completion_and_cap(self):
+        for policies, capped in ((("sync", "async", "async"), False),
+                                 (("async", "sync", "sync"), False),
+                                 (("sync", "async", "sync"), False),
+                                 (("sync", "async", "sync"), True)):
+            with self.subTest(policies=policies, capped=capped):
+                self.run_hierarchy(small_workload=True, asynchronous=True,
+                                   capped=capped, policies=policies)
 
     def test_metrics_disabled_keeps_exact_final_result(self):
         self.run_hierarchy(small_workload=True, metrics_enabled=False)

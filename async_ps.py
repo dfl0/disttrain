@@ -1,4 +1,4 @@
-"""Apply async updates at root and combine pending gradients at edges."""
+"""Handle async and mixed-policy aggregation."""
 import time
 import numpy as np
 from ps import ParameterServer
@@ -14,6 +14,7 @@ class AsyncParameterServer(ParameterServer):
     done_message = Msg.ASYNC_DONE
 
     def __init__(self, model, children_ids, sync, *args, worker_groups, reference_samples, trace=False, **kwargs):
+        self.synchronous = sync
         super().__init__(model, children_ids, sync, *args, **kwargs)
         if type(reference_samples) is not int or reference_samples <= 0:
             raise ValueError('reference sample count must be positive')
@@ -92,6 +93,8 @@ class AsyncParameterServer(ParameterServer):
 
     def _advance_pending(self):
         if not self.pending or self.inflight:
+            return
+        if self.synchronous and len(self.received) + len(self.finished) != len(self.children_ids):
             return
         if self.is_root:
             self._apply_pending()
@@ -190,6 +193,9 @@ class AsyncParameterServer(ParameterServer):
                 self.send(self._dealer, self.done_message, encode_version(self.upstream_request))
                 if self.lifecycle:
                     self.lifecycle.deadline = None
+        else:
+            # DONE can release a pending barrier
+            self._advance_pending()
 
     def _log_progress(self):
         mean_age = self.weighted_staleness / self.total_samples if self.total_samples else 0
