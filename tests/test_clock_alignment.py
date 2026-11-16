@@ -7,20 +7,23 @@ import threading
 import time
 import unittest
 
+import yaml
 import zmq
 
 from clock_alignment import ClockAlignment
 from export_trace import build_trace
+from analyze_runs import read_run, render_report
 from lifecycle import Lifecycle, RunStopped
 from metrics import MetricsRecorder
 
 
 class ClockTests(unittest.TestCase):
-    def test_mapping_and_trace_share_root_origin(self):
+    def test_mapping_report_and_trace_share_root_origin(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp)
             nodes = {'root': dict(role='root_ps'), 'worker': dict(role='worker'), 'eval': dict(role='eval')}
             (path / 'summary.json').write_text(json.dumps(dict(mode='ssh', outcome='success', nodes=nodes)))
+            (path / 'config.yaml').write_text(yaml.safe_dump(dict(nodes=[dict(id=k, **v) for k, v in nodes.items()])))
             root = MetricsRecorder(path / 'root.metrics')
             root.record('clock_origins', 'training', 10_000_000_000, 0)
             root.record('updates', 1., 1, 32, 1, 32, 1, 0, 0)
@@ -49,6 +52,14 @@ class ClockTests(unittest.TestCase):
             span = next(e for e in trace['traceEvents'] if e['ph'] == 'X')
             self.assertAlmostEqual(span['ts'] / 1e6, timestamp)
             self.assertEqual(span['args']['local_duration_us'], 100000.)
+            run = read_run(path)
+            self.assertAlmostEqual(run['resources'][0]['aligned_s'], timestamp)
+            self.assertAlmostEqual(run['evaluations'][0]['done_root_s'], timestamp)
+            self.assertAlmostEqual(run['evaluations'][0]['result_delay_s'], 4.0005)
+            html = render_report([run])
+            self.assertIn('Clock alignment', html)
+            self.assertIn('Throughput and device CPU', html)
+            self.assertIn('Evaluation result delay', html)
             # one sample provides an offset but no drift estimate
             clocks.anchors['worker'].pop('shutdown')
             self.assertIn('offset only', clocks.describe('worker')['method'])

@@ -1,0 +1,320 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>disttrain run comparison</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font: 15px/1.5 system-ui, sans-serif; margin: 32px auto; padding: 0 24px; max-width: 1400px; color: #172033; }
+    h2 { margin-top: 36px; }
+    h3 { margin-bottom: 8px; }
+    .overhead-plot { max-height: 650px; overflow-y: auto; }
+    .queue-stall { color: #a33b00; font-weight: 650; }
+    .note { color: #546078; font-size: 13px; }
+    .table-scroll { overflow: auto; max-height: 65vh; border: 1px solid #cbd2da; border-radius: 4px; }
+    table { border-collapse: separate; border-spacing: 0; width: 100%; table-layout: fixed; }
+    caption { text-align: left; padding: 10px; }
+    th, td { padding: 8px 12px; border-bottom: 1px solid #e2e8f0; text-align: right; vertical-align: top;
+             overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+    th { font-size: 13px; font-weight: 600; }
+    thead th { position: sticky; top: 0; z-index: 2; background: #f0f2f4; }
+    tbody td, tbody th { background: #fff; }
+    tbody tr:nth-child(even) td, tbody tr:nth-child(even) th { background: #fafbfc; }
+    tbody tr:hover td, tbody tr:hover th { background: #edf6ff; }
+    th:first-child { position: sticky; left: 0; z-index: 1; text-align: left; width: 26%; border-right: 1px solid #cbd2da; }
+    thead th:first-child { z-index: 3; }
+    .summary-table { min-width: 640px; }
+    .settings-table th, .settings-table td { text-align: left; }
+    .settings-table th:first-child { width: 180px; }
+    .different { color: #17458b; font-weight: 650; }
+    .chart { margin: 32px 0; }
+    .plot { overflow-x: auto; }
+    .plot > div { min-width: 900px; }
+    .run-toggles { display: flex; flex-wrap: nowrap; gap: 8px; margin: 10px 0;
+                   overflow-x: auto; padding: 0 0 12px 0; }
+    .run-toggles button { flex: 0 0 auto; white-space: nowrap; font: inherit; font-size: 13px;
+                          padding: 4px 8px; border: 1px solid #9ea4b4; border-radius: 4px;
+                          background: #f0f2f4; color: #172033; cursor: pointer; }
+    .run-toggles button[aria-pressed="false"] { background: #fff; color: #546078; }
+    .run-toggles button[aria-pressed="mixed"] { border-style: dashed; }
+    .run-toggles button:focus-visible { outline: 2px solid #2563eb; outline-offset: 2px; }
+    details { margin: 20px 0; background: #f0f2f4; border: 1px solid #9ea4b4; border-radius: 4px; }
+    summary { padding: 8px 12px; cursor: pointer; overflow-wrap: anywhere; }
+    .summary-contents { padding: 12px; background: #fafbfc; border-top: 1px solid #9ea4b4; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+    @media (max-width: 700px) { body { padding: 0 12px; } th, td { padding: 8px; } }
+  </style>
+  {% if plotly_js %}<script>{{ plotly_js | safe }}</script>{% endif %}
+</head>
+<body>
+  <h1>disttrain run comparison</h1>
+  <p>Offline report from recorded CSV measurements. Hover, zoom, or click legend entries to inspect runs.</p>
+  <p class="note">Missing values are shown as &mdash;, never assumed zero. Final accuracy is the last recorded evaluation,
+    not necessarily a completed run's final model. Equal update counts or worker-count changes need not represent
+    equal work or equal optimization. Single short runs do not establish a performance ranking.</p>
+
+  {% macro summary_table(title, columns) %}
+    <h2>{{ title }}</h2>
+    <div class="table-scroll" role="region" aria-label="{{ title }}" tabindex="0">
+      <table class="summary-table">
+        <thead><tr><th scope="col">Run</th>
+          {% for key, label in columns %}<th scope="col">{{ label }}</th>{% endfor %}
+        </tr></thead>
+        <tbody>
+          {% for row in rows %}
+          <tr><th scope="row">{{ row.name }}</th>
+            {% for key, label in columns %}<td>{{ row[key] }}</td>{% endfor %}
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endmacro %}
+
+  {{ summary_table('Runs and timing', [('mode', 'Mode / topology'), ('workers', 'Workers'), ('status', 'Status'),
+                                      ('training_elapsed', 'Training elapsed'), ('launcher_elapsed', 'Launcher elapsed')]) }}
+  <p class="note">Training elapsed is root's precisely recorded training time. Launcher elapsed also includes setup, evaluation and shutdown.</p>
+  {{ summary_table('Applied and discarded work', [('updates', 'Root updates'), ('contributions', 'Applied contributions'),
+                                                ('samples', 'Applied samples'), ('discarded', 'Discarded work')]) }}
+  <p class="note">Discarded work is shown as contributions / samples / partial-window samples.</p>
+  {{ summary_table('Last recorded evaluation', [('evaluated_version', 'Model version'), ('accuracy', 'Accuracy'), ('loss', 'Loss')]) }}
+
+  <h2>Clock alignment</h2>
+  <p class="note">Aligned plots use root training start as zero. Remote clocks use startup/shutdown timestamp exchanges;
+    linear correction is an estimate, not proof of constant drift. Error estimates describe endpoint network uncertainty,
+    not unobserved clock changes between endpoints. Drift below that uncertainty is not distinguishable from measurement noise.
+    Missing calibration is never silently treated as synchronized. Negative times can represent setup before root training.</p>
+  <div class="table-scroll">
+    <table class="summary-table">
+      <thead><tr><th>Run / node</th><th>Mapping</th><th>Startup ± ms</th><th>Shutdown ± ms</th><th>Correction ppm</th><th>Drift distinguishable?</th></tr></thead>
+      <tbody>{% for run in runs %}{% for clock in run.alignment %}
+        <tr><th>{{ run.name }} / {{ clock.node }}</th><td>{{ clock.method }}</td>
+          <td>{{ '%.3f'|format(clock.start_error_ms) if clock.start_error_ms is not none else '—' }}</td>
+          <td>{{ '%.3f'|format(clock.end_error_ms) if clock.end_error_ms is not none else '—' }}</td>
+          <td>{{ '%.3f'|format(clock.correction_ppm) if clock.correction_ppm is not none else '—' }}</td>
+          <td>{{ clock.drift_resolved if clock.drift_resolved is not none else '—' }}</td></tr>
+      {% endfor %}{% endfor %}</tbody>
+    </table>
+  </div>
+
+  <h2>Experiment settings</h2>
+  <p class="note">Differing settings are bold. Full saved configs appear below. Row labels and column headings stay visible when scrolling.</p>
+  <div class="table-scroll" role="region" aria-label="Experiment settings" tabindex="0">
+    <table class="settings-table" style="min-width: {{ 180 + runs|length * 150 }}px">
+      <thead><tr><th scope="col">Setting</th>
+        {% for run in runs %}<th scope="col">{{ run.name }}</th>{% endfor %}
+      </tr></thead>
+      <tbody>
+        {% for row in setting_rows %}
+        <tr><th scope="row">{{ row.label }}</th>
+          {% for value in row.cells %}<td{% if row.different %} class="different"{% endif %}>{{ value }}</td>{% endfor %}
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Measurement overhead</h2>
+  <ol>
+    <li><strong>Check queue stalls first.</strong> They mean a producer waited for the recorder's queue to drain.
+      Zero means no queue-full stalls were recorded, not zero instrumentation cost.</li>
+    <li><strong>Look at role-thread recording.</strong> This is time spent validating/enqueueing CSV records on
+      the training/evaluation thread, including traces. It is the most direct recorded interference with role work.</li>
+    <li><strong>Inspect background costs separately.</strong> Resource sampling is wall time in the monitoring
+      thread; writer CPU is CPU consumed by the CSV-writing thread. They can compete with training for CPU,
+      but their times overlap with training and with each other.</li>
+  </ol>
+  <p class="note">Totals cover the recorded run, including setup/shutdown calls where applicable, not only training or
+    the trace window. Each chart has a zero-based axis with its own labelled scale; bars are not stacked.
+    Compare similar-duration workloads; longer runs naturally accumulate more cost. Missing measurements are —, not zero.</p>
+  {% macro overhead_value(row, key) %}
+    {% if row[key] is not none %}
+      {{ '%.2f'|format(row[key]) }} ms
+    {% else %}—{% endif %}
+  {% endmacro %}
+  <div class="table-scroll" role="region" aria-label="Overhead summary" tabindex="0">
+    <table class="summary-table">
+      <thead><tr><th scope="col">Run / node</th><th scope="col">Role-thread recording<br>wall time</th>
+        <th scope="col">Resource sampler<br>wall time</th><th scope="col">CSV writer<br>CPU time</th>
+        <th scope="col">Queue stalls<br>wall time</th></tr></thead>
+      <tbody>{% for row in overhead_rows %}
+        <tr><th scope="row">{{ row.run }} / {{ row.node }}</th>
+          <td>{{ overhead_value(row, 'role_ms') }}
+            {% if row.role_us is not none %}<div class="note">{{ '%.2f'|format(row.role_us) }} µs / record call</div>{% endif %}
+            <div class="note">Recording-time fraction: {{ '%.3f%%'|format(row.fraction) if row.fraction is not none else '—' }}</div>
+            {% if row.window_s is not none %}<div class="note">over {{ '%.3f'|format(row.window_s) }} s recorder lifetime</div>{% endif %}</td>
+          <td>{{ overhead_value(row, 'resource_ms') }}
+            {% if row.query_ms is not none %}<div class="note">{{ '%.2f'|format(row.query_ms) }} ms / resource query cycle</div>{% endif %}</td>
+          <td>{{ overhead_value(row, 'writer_ms') }}</td>
+          <td class="{{ 'queue-stall' if row.queue_events else '' }}">{{ overhead_value(row, 'queue_ms') }}
+            <div class="note">{{ row.queue_events if row.queue_events is not none else '—' }} queue-full events</div></td>
+        </tr>
+      {% endfor %}</tbody>
+    </table>
+  </div>
+  <p class="note">Resource sampler totals include its resource/temperature recording calls as well as querying resources.
+    Queue stalls are already included in recording-call wall times, except shutdown-marker waits: do not add them again.
+    There is no valid “total slowdown” obtained by adding these columns or dividing their sum by training elapsed.
+    Timing/context-manager bookkeeping, calibration exchanges and other call-site work are not fully covered.
+    To measure actual slowdown, repeat the same workload with instrumentation off/on and compare elapsed time and quality.</p>
+  {% for chart in overhead_charts %}
+  <section class="chart">
+    <h3>{{ chart.title }}</h3>
+    <div class="plot overhead-plot">{{ chart.html | safe }}</div>
+  </section>
+  {% endfor %}
+  <p class="note">Bar labels and hover show the labelled units (milliseconds or percent). Color identifies the run.
+    Missing measurements are omitted from the charts, not represented as zero bars.
+    Queue stalls and per-call averages remain in the summary above.</p>
+  <p class="note"><strong>Recording-time fraction is not slowdown:</strong> it divides role-thread recording-call wall time
+    by that node's recorder lifetime (creation to close request, including setup/waiting/shutdown but excluding final writer drain).
+    It excludes console printing, background work and unmeasured instrumentation bookkeeping. Older runs without the measured
+    recorder window show —; root training time is not substituted as a different denominator.</p>
+
+  <h3>Controlled instrumentation comparison</h3>
+  {% if impact_rows %}
+  <p class="note">Explicit baseline; all included runs succeeded, have matching configuration/launch settings except metrics/monitoring,
+    and applied {{ impact_rows[0].samples }} samples. Positive percentages mean slower; negative means faster in these observations.
+    Bars compare median duration to baseline median; whiskers show observed min–max relative to that fixed median,
+    <strong>not confidence intervals</strong> and not propagated baseline uncertainty. N=1 does not establish a reliable slowdown.</p>
+  <div class="table-scroll">
+    <table class="summary-table">
+      <thead><tr><th>Group</th><th>Repeats</th><th>Training seconds<br>median [min, max]</th><th>Training change</th>
+        <th>Whole-run seconds<br>median [min, max]</th><th>Whole-run change</th></tr></thead>
+      <tbody>{% for row in impact_rows %}
+        <tr><th>{{ loop.index }}. {{ row.label }}</th><td>{{ row.count }}</td>
+          {% for key in ['training', 'launcher'] %}
+          <td>{{ '%.3f'|format(row[key].median) }}<br><span class="note">[{{ '%.3f'|format(row[key].low) }}, {{ '%.3f'|format(row[key].high) }}]</span></td>
+          <td>{{ '%+.2f%%'|format(row[key].slowdown) }}</td>
+          {% endfor %}
+        </tr>
+      {% endfor %}</tbody>
+    </table>
+  </div>
+  {% for chart in impact_charts %}
+    <section class="chart"><h3>{{ chart.title }}</h3><div class="plot">{{ chart.html | safe }}</div></section>
+  {% endfor %}
+  <details><summary>Comparison groups and included runs</summary><div class="summary-contents">
+    {% for row in impact_rows %}<h4>Group {{ loop.index }}: {{ row.label }}</h4>
+      <ul>{% for name in row.names %}<li>{{ name }}</li>{% endfor %}</ul>
+      <pre>{{ row.settings }}</pre>
+    {% endfor %}
+  </div></details>
+  <p class="note">Whole-run time includes launch/setup, calibration, evaluation, shutdown and artifact collection.
+    Training time ends at the last applied update. Neither is obtained by subtracting measured overhead counters.
+    Use the same deployed code/dependencies, repeat in alternating order, and compare quality as well as time;
+    asynchronous scheduling, host load and thermal state can change outcomes even when configuration matches.</p>
+  {% else %}
+  <p class="note">Actual slowdown requires reference runs. Include baseline and instrumented run directories and specify
+    <code>--baseline logs/BASELINE</code> (repeat the flag for baseline repetitions). Keep config/launch settings and actual
+    applied-sample counts matched except for metrics/monitoring. No slowdown is inferred from overhead counters alone.</p>
+  {% endif %}
+
+  <details>
+    <summary>Raw overhead components and per-call costs</summary>
+    <div class="summary-contents">
+      <p class="note">record:* is validation/enqueueing wall time, including queue waits. resource_sampling excludes recording
+        and console formatting. writer is thread CPU, excluding final statistics encoding/file close.
+        queue_backpressure includes waits from all producer threads and shutdown.</p>
+  <div class="table-scroll" role="region" aria-label="Measurement overhead" tabindex="0">
+    <table class="summary-table">
+      <thead><tr><th scope="col">Run / node</th><th scope="col">Component</th><th scope="col">Calls / records</th>
+        <th scope="col">Wall time (ms)</th><th scope="col">Wall time per call (µs)</th><th scope="col">CPU time (ms)</th></tr></thead>
+      <tbody>
+      {% for run in runs %}
+        {% for row in run.overhead %}
+        <tr><th scope="row">{{ run.name }} / {{ row.node }}</th><td>{{ row.component }}</td><td>{{ row.calls }}</td>
+          <td>{{ '%.3f'|format(row.wall_s * 1000) if row.wall_s is not none else '—' }}</td>
+          <td>{{ '%.3f'|format(row.wall_s * 1000000 / row.calls) if row.wall_s is not none and row.calls else '—' }}</td>
+          <td>{{ '%.3f'|format(row.cpu_s * 1000) if row.cpu_s is not none else '—' }}</td></tr>
+        {% else %}
+        <tr><th scope="row">{{ run.name }}</th><td colspan="5">No overhead measurements (disabled, unavailable or incomplete).</td></tr>
+        {% endfor %}
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+    </div>
+  </details>
+
+  <h2>Charts</h2>
+  {% for chart in charts %}
+  <section class="chart">
+    <h3>{{ chart.title }}</h3>
+    {% if chart.groups %}
+    <div class="run-toggles" data-plot="{{ chart.id }}" role="group" aria-label="Runs in {{ chart.title }}">
+      {% for group in chart.groups %}
+      <button type="button" data-traces="{{ group.indices | join(',') }}" aria-pressed="true" title="Click to toggle; double-click to isolate or restore all runs">{{ group.name }}</button>
+      {% endfor %}
+    </div>
+    {% endif %}
+    {# trust Plotly markup only; escape log and config text #}
+    <div class="plot">{{ chart.html | safe }}</div>
+    {% if chart.note %}<p class="note">{{ chart.note }}</p>{% endif %}
+  </section>
+  {% endfor %}
+  {% if not has_resources %}<p>No resource metrics were recorded; resource charts are omitted.</p>{% endif %}
+
+  <h2>Configurations and diagnostics</h2>
+  {% for run in details %}
+  <details>
+    <summary>{{ run.name }}</summary>
+    <div class="summary-contents">
+        <p>{{ run.path }}</p>
+        <ul>{% for warning in run.warnings %}<li>{{ warning }}</li>{% else %}<li>No parser warnings.</li>{% endfor %}</ul>
+        <h3>Saved configuration</h3><pre>{{ run.config }}</pre>
+        <h3>Launcher summary</h3><pre>{{ run.summary }}</pre>
+    </div>
+  </details>
+  {% endfor %}
+<script>
+  document.querySelectorAll('.run-toggles').forEach(controls => {
+    const plot = document.getElementById(controls.dataset.plot);
+    const buttons = [...controls.querySelectorAll('button')];
+    const indices = button => button.dataset.traces.split(',').map(Number);
+    const visible = index => plot.data[index].visible !== false && plot.data[index].visible !== 'legendonly';
+    function refresh() {
+      buttons.forEach(button => {
+        const traces = indices(button);
+        const count = traces.filter(visible).length;
+        button.setAttribute('aria-pressed', count === 0 ? 'false' : count === traces.length ? 'true' : 'mixed');
+      });
+    }
+    const clickDelayMs = 300;
+    buttons.forEach(button => {
+      let pendingClick = null;
+      const toggle = () => {
+        const traces = indices(button);
+        Plotly.restyle(plot, {visible: !traces.some(visible)}, traces).then(refresh);
+      };
+      button.addEventListener('click', event => {
+        // keyboard activation needs no double-click delay
+        if (event.detail === 0) {
+          clearTimeout(pendingClick);
+          pendingClick = null;
+          toggle();
+        } else if (pendingClick !== null) {
+          clearTimeout(pendingClick);
+          pendingClick = null;
+          const traces = indices(button);
+          const selected = new Set(traces);
+          const isolated = traces.some(visible) && plot.data.every((_, index) => selected.has(index) || !visible(index));
+          Plotly.restyle(plot, {visible: plot.data.map((_, index) => isolated || selected.has(index))}).then(refresh);
+        } else {
+          pendingClick = setTimeout(() => {
+            pendingClick = null;
+            toggle();
+          }, clickDelayMs);
+        }
+      });
+      // use our click window instead of the browser double-click threshold
+      button.addEventListener('dblclick', event => event.preventDefault());
+    });
+    plot.on('plotly_restyle', refresh);
+    refresh();
+  });
+</script>
+</body>
+</html>
